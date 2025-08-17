@@ -2,7 +2,7 @@ flask
 requests
 beautifulsoup4
 duckduckgo-search
-python-telegram-bot
+python-telegram-bot[webhooks]
 google-api-python-client
 google-auth
 google-auth-oauthlib
