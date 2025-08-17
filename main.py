@@ -1,5 +1,5 @@
 # ---------- Alex (All-in-One: Telegram + AI + Search + Logging + Uptime + Self-Heal) ----------
-import os, time, logging, csv, requests, sys, subprocess
+import os, time, logging, csv, requests, sys
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
@@ -14,10 +14,16 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# --- Keys ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_KEY")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "YOUR_SERPAPI_KEY")
+# --- Load Environment Keys ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+
+# Exit early if any required key is missing
+if not TELEGRAM_TOKEN:
+    sys.exit("❌ TELEGRAM_TOKEN not set in environment!")
+if not OPENAI_KEY:
+    sys.exit("❌ OPENAI_API_KEY not set in environment!")
 
 client = OpenAI(api_key=OPENAI_KEY)
 
@@ -43,6 +49,8 @@ def log_conversation(username, user_id, query, reply):
 
 # --- Google Search via SerpAPI ---
 def search_google(query):
+    if not SERPAPI_KEY:
+        return "⚠️ SERPAPI_KEY not set in environment!"
     url = "https://serpapi.com/search.json"
     params = {"q": query, "api_key": SERPAPI_KEY}
     try:
