@@ -1,5 +1,5 @@
-# ---------- Alex (Telegram bot with uptime + AI logging) ----------
-import os, time, logging, csv
+# ---------- Alex (All-in-One: Telegram + AI + Search + Logging + Uptime + Self-Heal) ----------
+import os, time, logging, csv, requests, sys, subprocess
 from datetime import datetime
 from telegram import Update
 from telegram.ext import (
@@ -8,29 +8,29 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# Logging setup
+# --- Logging setup ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# Bot token & OpenAI key
-TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_KEY_HERE"))
+# --- Keys ---
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_KEY")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "YOUR_SERPAPI_KEY")
 
-# Track uptime
+client = OpenAI(api_key=OPENAI_KEY)
+
+# --- Uptime ---
 start_time = time.time()
-
 def get_uptime():
     uptime = int(time.time() - start_time)
     hours, remainder = divmod(uptime, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours}h {minutes}m {seconds}s"
 
-# File to store logs
+# --- CSV Logging ---
 LOG_FILE = "ai_conversations.csv"
-
-# Ensure CSV file has headers
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -41,9 +41,25 @@ def log_conversation(username, user_id, query, reply):
         writer = csv.writer(f)
         writer.writerow([datetime.utcnow().isoformat(), username, user_id, query, reply])
 
-# ---- Commands ----
+# --- Google Search via SerpAPI ---
+def search_google(query):
+    url = "https://serpapi.com/search.json"
+    params = {"q": query, "api_key": SERPAPI_KEY}
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        if "organic_results" in data:
+            top = data["organic_results"][:3]
+            results = "\n".join([f"{r['title']} - {r.get('link','')}" for r in top])
+            return f"🔎 Top results for '{query}':\n{results}"
+        else:
+            return "⚠️ No results found."
+    except Exception as e:
+        return f"❌ Search failed: {e}"
+
+# --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Alex is awake and ready ✅")
+    await update.message.reply_text("🤖 Alex is online and ready ✅")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime = get_uptime()
@@ -59,46 +75,64 @@ async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
 
     try:
-        # Call GPT model
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": query}]
         )
         reply = completion.choices[0].message.content.strip()
-
-        # Send reply to user
         await update.message.reply_text(reply)
-
-        # Log conversation
         log_conversation(username, user_id, query, reply)
-
     except Exception as e:
         logging.error(f"AI error: {e}")
-        await update.message.reply_text("⚠️ Sorry, AI request failed.")
+        await update.message.reply_text("⚠️ AI request failed.")
 
-# Error handler
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text.lower() == "you there?":
+        uptime = get_uptime()
+        await update.message.reply_text(f"✅ Yes Blaize, I'm here.\n⏱ Uptime: {uptime}")
+
+    elif text.lower().startswith("search "):
+        query = text[7:].strip()
+        results = search_google(query)
+        await update.message.reply_text(results)
+
+    else:
+        await update.message.reply_text(
+            "⚡ Commands:\n"
+            "- `you there?`\n"
+            "- `search <query>`\n"
+            "- `/ai <query>`"
+        )
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error(msg="Exception while handling update:", exc_info=context.error)
     if isinstance(update, Update) and update.message:
         await update.message.reply_text("⚠️ Oops, something went wrong!")
 
-# ---- Main ----
-def main():
-    app = Application.builder().token(TOKEN).build()
+# --- Main Bot Function ---
+def run_bot():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("ai", ai))
-
-    # Custom wake command
-    app.add_handler(MessageHandler(filters.Regex(r'(?i)^you there\?$'), ping))
-
-    # Error handling
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    # Run bot
-    logging.info("🤖 Alex is running...")
+    logging.info("🚀 Alex is running...")
     app.run_polling()
+
+# --- Self-Heal Loop ---
+def main():
+    while True:
+        try:
+            run_bot()
+        except Exception as e:
+            logging.error(f"💥 Bot crashed with error: {e}")
+            logging.info("♻️ Restarting in 5 seconds...")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
