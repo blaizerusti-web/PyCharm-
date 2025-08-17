@@ -67,7 +67,7 @@ def search_google(query):
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Alex is online and ready ✅")
+    await update.message.reply_text("🤖 Alex is online and ready ✅\n\n⚡ Commands:\n- you there?\n- search <query>\n- /ai <query>")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime = get_uptime()
@@ -109,9 +109,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "⚡ Commands:\n"
-            "- `you there?`\n"
-            "- `search <query>`\n"
-            "- `/ai <query>`"
+            "- you there?\n"
+            "- search <query>\n"
+            "- /ai <query>"
         )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
