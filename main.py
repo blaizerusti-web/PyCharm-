@@ -1,9 +1,8 @@
-# ---------- Alex (clean, autonomous, always-online, self-healing) ----------
-import os, json, threading, asyncio, time, logging
-import requests
-from flask import Flask
+# ---------- Alex (webhook, Railway-optimized, logging, always-online) ----------
+import os, json, logging
+from flask import Flask, request
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from duckduckgo_search import DDGS
 import feedparser
 import openai
@@ -15,24 +14,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Alex")
 
-# --- Flask server for Railway keep-alive ---
+# --- Flask server ---
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Alex is alive, self-healing, and running 24/7!"
+    return "✅ Alex is alive and running on Railway (webhook mode)!"
 
 # --- Config from environment variables ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+RAILWAY_URL = os.getenv("RAILWAY_URL")  # e.g. https://your-app.up.railway.app
 openai.api_key = OPENAI_API_KEY
 
-# --- Telegram bot setup ---
+# --- Telegram app ---
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 
 # --- Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey, I’m Alex — alive 24/7, logging everything, and self-healing!")
+    await update.message.reply_text("Hey, I’m Alex — alive 24/7 on Railway, webhook mode!")
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
@@ -42,10 +42,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with DDGS() as ddgs:
             results = [r for r in ddgs.text(query, max_results=3)]
-        if results:
-            reply = "\n\n".join([f"🔎 {r['title']}\n{r['href']}" for r in results])
-        else:
-            reply = "No results found."
+        reply = "\n\n".join([f"🔎 {r['title']}\n{r['href']}" for r in results]) if results else "No results found."
     except Exception as e:
         logger.error(f"Search error: {e}")
         reply = "⚠️ Error fetching results."
@@ -62,9 +59,9 @@ async def rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Error fetching RSS feed.")
 
 async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(context.args)
+    query = update.message.text
     if not query:
-        await update.message.reply_text("Usage: /ai <your prompt>")
+        await update.message.reply_text("⚠️ Please type something after /ai or just send a message.")
         return
     try:
         response = openai.ChatCompletion.create(
@@ -83,19 +80,21 @@ application.add_handler(CommandHandler("rss", rss))
 application.add_handler(CommandHandler("ai", ai))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai))
 
-# --- Bot runner with auto-restart (self-healing loop) ---
-def run_bot():
-    while True:
-        try:
-            logger.info("Starting Alex bot (polling mode)...")
-            asyncio.run(application.run_polling())
-        except Exception as e:
-            logger.error(f"Bot crashed with error: {e}. Restarting in 5s...")
-            time.sleep(5)  # wait before restart to avoid crash loop
+# --- Telegram webhook route ---
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put_nowait(update)
+    return "ok"
 
-# --- Background thread for bot ---
-threading.Thread(target=run_bot, daemon=True).start()
-
-# --- Keep Flask alive (needed by Railway) ---
+# --- Start webhook on Railway ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    logger.info("🚀 Starting Alex in webhook mode on Railway...")
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TELEGRAM_TOKEN,
+        webhook_url=f"{RAILWAY_URL}/{TELEGRAM_TOKEN}"
+    )
+    app.run(host="0.0.0.0", port=port)
