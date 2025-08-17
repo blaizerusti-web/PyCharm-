@@ -1,5 +1,5 @@
 # ---------- Alex (clean, autonomous, always-online) ----------
-import os, time, json, threading
+import os, json, threading, asyncio
 import requests
 from flask import Flask, request
 from telegram import Update
@@ -65,13 +65,17 @@ application.add_handler(CommandHandler("rss", rss))
 application.add_handler(CommandHandler("ai", ai))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai))
 
-# --- Run bot in background thread ---
+# --- Run bot in background thread with its own asyncio loop ---
 def run_bot():
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
-        url_path="webhook",
-        webhook_url=WEBHOOK_URL
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.environ.get("PORT", 5000)),
+            url_path="webhook",
+            webhook_url=WEBHOOK_URL
+        )
     )
 
 threading.Thread(target=run_bot, daemon=True).start()
