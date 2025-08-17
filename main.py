@@ -1,5 +1,6 @@
-# ---------- Alex (hybrid: polling locally, webhook on Railway) ----------
-import os, json, threading, asyncio, time, logging
+# ---------- Alex (all-in-one with keep-alive + uptime ping) ----------
+import os, asyncio, logging, threading, time, requests
+from datetime import timedelta
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -19,20 +20,27 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Alex is alive and running 🚀"
+    return "Alex is alive 🚀"
 
 # --- Config from env vars ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-RAILWAY_URL = os.getenv("RAILWAY_URL")  # set in Railway, e.g. https://your-app.up.railway.app
+RAILWAY_URL = os.getenv("RAILWAY_URL")  # e.g. https://your-app.up.railway.app
 openai.api_key = OPENAI_API_KEY
+
+# --- Uptime tracker ---
+START_TIME = time.time()
+
+def get_uptime():
+    uptime_seconds = int(time.time() - START_TIME)
+    return str(timedelta(seconds=uptime_seconds))
 
 # --- Telegram bot setup ---
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 
 # --- Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey, I’m Alex — alive 24/7 and hybrid mode ready!")
+    await update.message.reply_text("Hey, I’m Alex — alive 24/7 hybrid mode ready!")
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
@@ -53,8 +61,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rss(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        feed_url = "https://news.google.com/rss"
-        feed = feedparser.parse(feed_url)
+        feed = feedparser.parse("https://news.google.com/rss")
         articles = "\n\n".join([f"📰 {e.title}\n{e.link}" for e in feed.entries[:5]])
         await update.message.reply_text(articles)
     except Exception as e:
@@ -76,30 +83,54 @@ async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"AI error: {e}")
         await update.message.reply_text("⚠️ AI request failed.")
 
+# --- Uptime ping: "you there?" ---
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uptime_str = get_uptime()
+    await update.message.reply_text(
+        f"Yep, I’m here and alive ✅\n⏱️ Uptime: {uptime_str}"
+    )
+
 # --- Handlers ---
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("search", search))
 application.add_handler(CommandHandler("rss", rss))
 application.add_handler(CommandHandler("ai", ai))
+
+# Custom "you there?" trigger
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^(?i)you there\?$"), status))
+
+# Default: any other text → AI
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai))
 
-# --- Bot runner ---
-def run_bot():
-    if RAILWAY_URL:  # 🚀 On Railway, use webhook
+# --- Keep-alive (self-ping) ---
+def keep_alive():
+    if not RAILWAY_URL:
+        return
+    while True:
+        try:
+            requests.get(RAILWAY_URL)
+            logger.info("Keep-alive ping sent ✅")
+        except Exception as e:
+            logger.warning(f"Keep-alive failed: {e}")
+        time.sleep(300)  # every 5 min
+
+# --- Hybrid runner ---
+async def main():
+    if RAILWAY_URL:  # 🚀 On Railway → webhook
+        threading.Thread(target=keep_alive, daemon=True).start()
         logger.info("Running in WEBHOOK mode...")
-        asyncio.run(application.run_webhook(
+        await application.run_webhook(
             listen="0.0.0.0",
             port=int(os.environ.get("PORT", 8443)),
             url_path=TELEGRAM_TOKEN,
             webhook_url=f"{RAILWAY_URL}/{TELEGRAM_TOKEN}"
-        ))
-    else:  # 🖥️ Local, use polling
+        )
+    else:  # 🖥️ Local → polling
         logger.info("Running in POLLING mode...")
-        asyncio.run(application.run_polling())
+        await application.run_polling()
 
-# --- Background thread for bot ---
-threading.Thread(target=run_bot, daemon=True).start()
-
-# --- Keep Flask alive ---
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped.")
