@@ -617,20 +617,36 @@ def build_bot_app() -> Application:
     app.add_error_handler(error_handler)
     return app
 
-# ✅ Async (no threads): run Telegram + health server within the same event loop
+# ✅ Async polling without Updater.wait_until_idle (PTB v20+ safe)
 async def run_telegram_polling():
     app = build_bot_app()
     log.info("🚀 Alex is running (Telegram polling)...")
 
-    # initialize & start app, then start polling
     await app.initialize()
     await app.start()
+
+    # Ensure we're not in webhook mode before polling
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning(f"delete_webhook warning: {e}")
+
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-    # run until idle (Ctrl+C / SIGTERM stops it)
-    await app.updater.wait_until_idle()
+    # Idle until SIGINT/SIGTERM
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            # e.g., on Windows or restricted environments
+            pass
+
+    await stop_event.wait()
 
     # graceful shutdown
+    await app.updater.stop()
     await app.stop()
     await app.shutdown()
 
@@ -645,7 +661,7 @@ def main():
         await run_health_server()
         await run_telegram_polling()
 
-    # Use asyncio.run to ensure a proper event loop exists (fixes "no current event loop" error)
+    # Use asyncio.run to ensure a proper event loop exists
     try:
         asyncio.run(orchestrate())
     except KeyboardInterrupt:
