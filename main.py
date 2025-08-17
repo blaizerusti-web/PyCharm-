@@ -1,5 +1,5 @@
 # ---------- Alex (all-in-one, env vars, OpenAI integrated) ----------
-import os, sys, json, time, threading, subprocess, socket
+import os, sys, json, time, threading, subprocess, socket, asyncio
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -59,6 +59,15 @@ GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# ---------- Debug Env Vars ----------
+print("DEBUG: BOT_NAME =", BOT_NAME)
+print("DEBUG: USER_NAME =", USER_NAME)
+print("DEBUG: TELEGRAM_BOT_TOKEN =", "SET" if TELEGRAM_BOT_TOKEN else "MISSING")
+print("DEBUG: OWNER_ID =", OWNER_ID)
+print("DEBUG: GOOGLE_SHEET_ID =", GOOGLE_SHEET_ID)
+print("DEBUG: PUBLIC_URL =", PUBLIC_URL)
+print("DEBUG: OPENAI_API_KEY =", "SET" if OPENAI_API_KEY else "MISSING")
 
 # Auto-detect Replit public URL if not set
 if not PUBLIC_URL:
@@ -252,26 +261,21 @@ async def daily_checkin(context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-async def keepalive_ping(context: ContextTypes.DEFAULT_TYPE):
-    if not PUBLIC_URL:
-        return
-    try:
-        requests.get(PUBLIC_URL.rstrip("/") + "/health", timeout=5)
-    except:
-        pass
+# ---------- Main Runner ----------
+def main():
+    # Start Flask in background
+    threading.Thread(target=run_flask, daemon=True).start()
 
-# ---------- Run ----------
-def run_bot():
+    # Start Telegram
     app_tg = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app_tg.add_handler(CommandHandler("start", start))
     app_tg.add_handler(CommandHandler("web", web_cmd))
-    app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_router))
-    jq = app_tg.job_queue
-    jq.run_repeating(daily_checkin, interval=86400, first=30)
-    jq.run_repeating(keepalive_ping, interval=300, first=60)
-    print("🚀 Alex is live.")
-    app_tg.run_polling(drop_pending_updates=True)
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_router))
+
+    app_tg.job_queue.run_daily(daily_checkin, time=time.struct_time((0,0,9,0,0,0,0,0,0)))  # 9 AM UTC
+
+    print("✅ Alex is online and running...")
+    app_tg.run_polling()
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    run_bot()
+    main()
