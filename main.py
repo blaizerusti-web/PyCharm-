@@ -442,7 +442,9 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with _db_lock:
         conv_count = _db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    with _db_lock:
         facts_count = _db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    with _db_lock:
         notes_count = _db.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
     await update.message.reply_text(f"📊 Stats — conversations: {conv_count}, facts: {facts_count}, notes: {notes_count}")
 
@@ -615,35 +617,43 @@ def build_bot_app() -> Application:
     app.add_error_handler(error_handler)
     return app
 
-def run_bot_polling():
+# ✅ Async (no threads): run Telegram + health server within the same event loop
+async def run_telegram_polling():
     app = build_bot_app()
     log.info("🚀 Alex is running (Telegram polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # initialize & start app, then start polling
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    # run until idle (Ctrl+C / SIGTERM stops it)
+    await app.updater.wait_until_idle()
+
+    # graceful shutdown
+    await app.stop()
+    await app.shutdown()
 
 # ---------------- Main (with self-heal + background learning) ----------------
 def main():
-    # background learner
+    # background learner (separate daemon thread)
     t = threading.Thread(target=self_learning_worker, kwargs={"interval_seconds": 60}, daemon=True)
     t.start()
 
-    # health server in asyncio loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    async def orchestrate():
+        # Start health server (non-blocking) then Telegram polling
+        await run_health_server()
+        await run_telegram_polling()
 
-    async def start_all():
-        asyncio.create_task(run_health_server())
-        # run Telegram polling (blocking) in a thread to coexist with aiohttp
-        loop.run_in_executor(None, run_bot_polling)
-
-    def handle_sigterm(signum, frame):
-        log.info("🛑 Received shutdown signal — exiting.")
-        os._exit(0)
-
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    signal.signal(signal.SIGINT, handle_sigterm)
-
-    loop.run_until_complete(start_all())
-    loop.run_forever()
+    # Use asyncio.run to ensure a proper event loop exists (fixes "no current event loop" error)
+    try:
+        asyncio.run(orchestrate())
+    except KeyboardInterrupt:
+        log.info("🛑 Received keyboard interrupt — exiting.")
+    except SystemExit:
+        log.info("🛑 System exit requested.")
+    except Exception as e:
+        log.error(f"Fatal error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
