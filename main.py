@@ -2,6 +2,7 @@
 import os, sys, json, time, threading, subprocess, socket, asyncio
 from pathlib import Path
 from typing import List, Dict, Any
+from datetime import time as dtime   # ✅ added this import
 
 # Auto-install (Replit self-heal)
 def install_requirements():
@@ -272,7 +273,8 @@ def main():
     app_tg.add_handler(CommandHandler("web", web_cmd))
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_router))
 
-    app_tg.job_queue.run_daily(daily_checkin, time=time.struct_time((0,0,9,0,0,0,0,0,0)))  # 9 AM UTC
+    # ✅ FIXED: use datetime.time, not struct_time
+    app_tg.job_queue.run_daily(daily_checkin, time=dtime(hour=9, minute=0))  # 9 AM UTC
 
     print("✅ Alex is online and running...")
     app_tg.run_polling()
