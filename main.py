@@ -1,7 +1,11 @@
-# ---------- Alex (All-in-One: Natural Chat + Live Web + Memory + Self-Learning + Voice + Images + SQLite) ----------
+# ---------- main.py | Alex (All-in-One: Natural Chat + Live Web + Memory + Self-Learning + Voice + Images + SQLite) ----------
+# Single-file, Railway-ready. Persistent storage, health server, Telegram bot (PTB v20+), OpenAI (chat+TTS+images),
+# SerpAPI enrichment, self-learning background worker, and simple config (startup visit counter).
+
 import os, sys, time, csv, json, threading, logging, tempfile, requests, re, asyncio, signal, sqlite3
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
@@ -9,7 +13,7 @@ from aiohttp import web
 
 # ---------------- Logging ----------------
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("alex")
@@ -28,12 +32,11 @@ client = OpenAI(api_key=OPENAI_KEY)
 
 # ---------------- Data directory (Railway-friendly) ----------------
 def select_data_dir() -> str:
-    # Prefer a mounted volume if provided by Railway
     candidates = [
-        os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),
+        os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),  # preferred if present
         "/mnt/data",
         "/data",
-        os.getcwd(),  # fallback to local
+        os.getcwd(),  # fallback
     ]
     for path in candidates:
         if not path:
@@ -41,16 +44,40 @@ def select_data_dir() -> str:
         try:
             os.makedirs(path, exist_ok=True)
             testfile = os.path.join(path, ".rw_test")
-            with open(testfile, "w") as f:
+            with open(testfile, "w", encoding="utf-8") as f:
                 f.write("ok")
             os.remove(testfile)
             return path
-        except Exception:
+        except Exception as e:
+            log.warning(f"Data dir candidate failed ({path}): {e}")
             continue
     return os.getcwd()
 
 DATA_DIR = select_data_dir()
 log.info(f"📁 Data directory: {DATA_DIR}")
+
+# ---------------- Config (simple persistent JSON) ----------------
+CONFIG_FILE = os.path.join(DATA_DIR, "alex_config.json")
+def load_config() -> Dict[str, Any]:
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"Config load issue: {e}")
+    return {}
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log.error(f"Config save issue: {e}")
+
+config = load_config()
+config["visits"] = int(config.get("visits", 0)) + 1
+save_config(config)
+log.info(f"✅ Alex has been started {config['visits']} times (persistent).")
 
 # ---------------- Files (persisted) ----------------
 LOG_FILE   = os.path.join(DATA_DIR, "ai_conversations.csv")   # conversation transcript
@@ -105,7 +132,11 @@ db_init()
 
 def db_put_kv(key: str, value: str):
     with _db_lock, _db:
-        _db.execute("INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        _db.execute(
+            "INSERT INTO kv(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value)
+        )
 
 def db_get_kv(key: str, default: Optional[str] = None) -> Optional[str]:
     with _db_lock:
@@ -122,11 +153,13 @@ def db_add_convo(ts: str, username: str, user_id: int, query: str, reply: str):
 
 def db_add_fact(text: str):
     with _db_lock, _db:
-        _db.execute("INSERT INTO facts(text, created_utc) VALUES(?, ?)", (text, datetime.now(timezone.utc).isoformat()))
+        _db.execute("INSERT INTO facts(text, created_utc) VALUES(?, ?)",
+                    (text, datetime.now(timezone.utc).isoformat()))
 
 def db_add_note(text: str):
     with _db_lock, _db:
-        _db.execute("INSERT INTO notes(text, created_utc) VALUES(?, ?)", (text, datetime.now(timezone.utc).isoformat()))
+        _db.execute("INSERT INTO notes(text, created_utc) VALUES(?, ?)",
+                    (text, datetime.now(timezone.utc).isoformat()))
 
 # ---------------- State (JSON + KV mirror) ----------------
 DEFAULT_PERSONA = (
@@ -149,10 +182,8 @@ DEFAULT_STATE: Dict[str, Any] = {
 _state_lock = threading.Lock()
 
 def load_state() -> Dict[str, Any]:
-    # Try JSON
     if not os.path.exists(STATE_FILE):
         save_state(DEFAULT_STATE)
-        # Also mirror to kv
         db_put_kv("persona", DEFAULT_PERSONA)
         db_put_kv("last_seen_row", "1")
         return DEFAULT_STATE.copy()
@@ -161,13 +192,11 @@ def load_state() -> Dict[str, Any]:
             data = json.load(f)
         for k, v in DEFAULT_STATE.items():
             data.setdefault(k, v)
-        # Mirror persona/last_seen_row into kv (best effort)
         db_put_kv("persona", data.get("persona", DEFAULT_PERSONA))
         db_put_kv("last_seen_row", str(data.get("last_seen_row", 1)))
         return data
     except Exception as e:
         log.error(f"Failed to read state file: {e}")
-        # Fallback to kv if available
         persona = db_get_kv("persona", DEFAULT_PERSONA)
         last_seen_row = int(db_get_kv("last_seen_row", "1"))
         data = DEFAULT_STATE.copy()
@@ -179,7 +208,6 @@ def save_state(data: Dict[str, Any]) -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-        # Mirror to kv
         db_put_kv("persona", data.get("persona", DEFAULT_PERSONA))
         db_put_kv("last_seen_row", str(data.get("last_seen_row", 1)))
     except Exception as e:
@@ -236,440 +264,4 @@ def search_google(query: str) -> str:
             return "No strong results found."
         lines = [f"- {it.get('title','(untitled)')} — {it.get('link','')}" for it in items]
         return "🔎 Top results:\n" + "\n".join(lines)
-    except Exception as e:
-        return f"❌ Search failed: {e}"
-
-def fetch_news(topic: str = "technology") -> List[Dict[str, str]]:
-    if not SERPAPI_KEY:
-        return []
-    try:
-        res = requests.get(
-            "https://serpapi.com/search.json",
-            params={"engine": "google_news", "q": topic, "api_key": SERPAPI_KEY},
-            timeout=15,
-        )
-        data = res.json()
-        stories = []
-        for item in (data.get("news_results") or [])[:5]:
-            stories.append({"title": item.get("title", ""), "link": item.get("link", "")})
-        return stories
-    except Exception as e:
-        log.error(f"News fetch error: {e}")
-        return []
-
-# --------------- Heuristic: should we auto-enrich with web? (no prompt needed) ---------------
-WEB_TRIGGERS = re.compile(
-    r"\b(today|now|current|latest|breaking|price|stock|score|weather|news|update|live|"
-    r"this week|this month|tonight|forecast|release|launched|announced|earnings|who won|"
-    r"when is|schedule|deadline|trending|reddit|twitter|x\.com)\b",
-    re.IGNORECASE,
-)
-
-def should_web_enrich(text: str) -> bool:
-    if WEB_TRIGGERS.search(text):
-        return True
-    if "http://" in text or "https://" in text:
-        return True
-    if "?" in text and re.search(r"[A-Z][a-z]{2,}\s", text):
-        return True
-    return False
-
-def auto_web_enrich(text: str) -> Optional[str]:
-    if not SERPAPI_KEY:
-        return None
-    try:
-        res = requests.get(
-            "https://serpapi.com/search.json",
-            params={"q": text, "api_key": SERPAPI_KEY, "num": 5},
-            timeout=15,
-        )
-        j = res.json()
-        items = (j.get("organic_results") or [])[:3]
-        if not items:
-            return None
-        bullets = [f"- {it.get('title','(untitled)')} — {it.get('link','')}" for it in items]
-        return "🌐 Web (auto):\n" + "\n".join(bullets)
-    except Exception as e:
-        log.warning(f"Auto-enrich failed: {e}")
-        return None
-
-# ---------------- Prompt construction ----------------
-def build_system_prompt() -> str:
-    with _state_lock:
-        st = load_state()
-        persona = st.get("persona", DEFAULT_PERSONA)
-        facts = st.get("facts", [])[:12]
-        notes = st.get("notes", [])[-12:]
-
-    blocks = [
-        persona,
-        "Use the following long-term memory when relevant:",
-        *[f"- {f}" for f in facts],
-        "Recent distilled notes:",
-        *[f"- {n}" for n in notes],
-        "Style: warm, direct, practical; avoid filler; prefer short paragraphs and lists; ask clarifying only when critical."
-    ]
-    return "\n".join(blocks)
-
-def gpt_reply(user_text: str) -> str:
-    system_prompt = build_system_prompt()
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.6,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        log.error(f"OpenAI error: {e}")
-        return "I hit a snag talking to my brain. Try again in a moment."
-
-# ---------------- Voice (on demand with “alex say …”) ----------------
-async def tts_send(update: Update, text: str):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            speech = client.audio.speech.create(
-                model="gpt-4o-mini-tts",
-                voice="alloy",
-                input=text[:4096],
-            )
-            tmp.write(speech.content)
-            path = tmp.name
-        with open(path, "rb") as f:
-            await update.message.reply_voice(f)
-        os.remove(path)
-    except Exception as e:
-        log.error(f"TTS error: {e}")
-        await update.message.reply_text("Couldn't generate audio; sent text instead.")
-
-# ---------------- Commands ----------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey Blaize 👋 Alex is online — learning and evolving 24/7.")
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"✅ Alive. Uptime {get_uptime()}")
-
-async def cmd_net(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _state_lock:
-        st = load_state()
-    ok = "✅" if st.get("net_ok") else "❌"
-    ms = st.get("last_net_ms")
-    ts = st.get("last_net_check")
-    await update.message.reply_text(f"{ok} Net: {ms if ms is not None else '-'} ms | last check: {ts or '-'}")
-
-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("What should we think about? 🙂  Example: `/ai best laptop under 1k`")
-        return
-    q = " ".join(context.args)
-    prefix = auto_web_enrich(q) if should_web_enrich(q) else None
-    reply = gpt_reply(q)
-    final = f"{prefix}\n\n{reply}" if prefix else reply
-    await update.message.reply_text(final)
-    u = update.message.from_user
-    log_conversation(u.username or "Unknown", u.id, q, final)
-
-async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _state_lock:
-        st = load_state()
-    persona = st.get("persona", DEFAULT_PERSONA)
-    facts = st.get("facts", [])
-    notes = st.get("notes", [])[-10:]
-    msg = (
-        f"🧠 **Persona**:\n{persona}\n\n"
-        f"📌 **Facts** ({len(facts)}):\n" + ("\n".join([f"- {f}" for f in facts[:12]]) or "—") + "\n\n"
-        f"🗒️ **Recent Notes**:\n" + ("\n".join([f"- {n}" for n in notes]) or "—")
-    )
-    await update.message.reply_text(msg)
-
-async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Teach me something to remember, e.g. `/learn I prefer short bullet answers.`")
-        return
-    fact = " ".join(context.args).strip()
-    with _state_lock:
-        st = load_state()
-        st.setdefault("facts", []).insert(0, fact)
-        st["facts"] = st["facts"][:60]
-        save_state(st)
-    db_add_fact(fact)
-    await update.message.reply_text("Saved to long-term memory ✅")
-
-async def cmd_resetmemory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _state_lock:
-        st = load_state()
-        st["facts"], st["notes"] = [], []
-        st["persona"] = DEFAULT_PERSONA
-        save_state(st)
-    await update.message.reply_text("Memory and persona reset ✅")
-
-async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    topic = " ".join(context.args).strip() if context.args else "technology"
-    items = fetch_news(topic)
-    if not items:
-        await update.message.reply_text("News lookup needs `SERPAPI_KEY` or found nothing.")
-        return
-    lines = [f"- {it['title']} — {it['link']}" for it in items]
-    await update.message.reply_text("📰 Latest:\n" + "\n".join(lines))
-    with _state_lock:
-        st = load_state()
-        st["last_news"] = items
-        save_state(st)
-
-# ✅ Image generation
-async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("🎨 Describe what you want me to imagine. Example:\n`/imagine a futuristic city skyline`")
-        return
-    prompt = " ".join(context.args).strip()
-    await update.message.reply_text(f"✨ Creating image: {prompt}")
-    try:
-        result = client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt,
-            size="1024x1024"
-        )
-        url = result.data[0].url
-        await update.message.reply_photo(photo=url, caption=f"🖼️ {prompt}")
-    except Exception as e:
-        log.error(f"Image generation error: {e}")
-        await update.message.reply_text("❌ Couldn't generate the image.")
-
-# Extra: quick stats
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _db_lock:
-        conv_count = _db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-    with _db_lock:
-        facts_count = _db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    with _db_lock:
-        notes_count = _db.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-    await update.message.reply_text(f"📊 Stats — conversations: {conv_count}, facts: {facts_count}, notes: {notes_count}")
-
-# ---------------- Natural free chat / routing ----------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    u = update.message.from_user
-    username = u.username or "Unknown"
-
-    # quick pings
-    if text.lower() == "you there?":
-        await update.message.reply_text(f"Always here 👊 (uptime {get_uptime()})")
-        return
-
-    # search (manual)
-    if text.lower().startswith("search "):
-        q = text[7:].strip()
-        await update.message.reply_text(search_google(q))
-        return
-
-    # voice only on explicit trigger
-    if text.lower().startswith("alex say "):
-        phrase = text[9:].strip()
-        if not phrase:
-            await update.message.reply_text("What should I say?")
-            return
-        await update.message.reply_text(f"🎙️ Okay: {phrase}")
-        await tts_send(update, phrase)
-        return
-
-    # auto web enrichment when useful (no prompt required)
-    prefix = auto_web_enrich(text) if should_web_enrich(text) else None
-
-    # normal, natural AI reply (with memory/persona)
-    reply = gpt_reply(text)
-    final = f"{prefix}\n\n{reply}" if prefix else reply
-    await update.message.reply_text(final)
-    log_conversation(username, u.id, text, final)
-
-# ---------------- Error handler ----------------
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Exception while handling update:", exc_info=context.error)
-    if isinstance(update, Update) and update.message:
-        await update.message.reply_text("Something glitched, but I’m back.")
-
-# ---------------- Self-Learning Utilities ----------------
-def read_new_rows_since(idx_start: int) -> List[Dict[str, str]]:
-    rows = []
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            rdr = list(csv.DictReader(f))
-        for i, row in enumerate(rdr, start=1):
-            if i >= idx_start:
-                rows.append(row)
-    except Exception as e:
-        log.error(f"Read CSV error: {e}")
-    return rows
-
-def summarize_and_update_persona(notes_text: str, current_persona: str) -> Dict[str, Any]:
-    try:
-        prompt = (
-            "You are maintaining a long-lived AI assistant called Alex.\n"
-            "Given the recent conversation snippets below, first produce 3-6 concise bullet 'Notes' "
-            "about user preferences, recurring topics, or helpful procedures (actionable, durable). "
-            "Then propose up to two subtle improvements to Alex's persona (voice/tone/skills) "
-            "that will make him more helpful for this user. Keep persona changes small and compatible.\n\n"
-            f"Current persona:\n{current_persona}\n\n"
-            f"Recent conversation snippets:\n{notes_text}\n"
-        )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.4,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = resp.choices[0].message.content.strip()
-
-        notes, new_persona = [], current_persona
-        for line in text.splitlines():
-            s = line.strip(" •-").strip()
-            if not s or s.lower().startswith(("persona", "notes")):
-                continue
-            notes.append(s)
-
-        if "\n\n" in text:
-            chunks = [c.strip() for c in text.split("\n\n") if c.strip()]
-            if len(chunks) >= 2:
-                new_persona = chunks[-1][:1200]
-
-        return {"notes_texts": notes[:6], "persona": new_persona or current_persona}
-    except Exception as e:
-        log.error(f"Self-learning summary error: {e}")
-        return {"notes_texts": [], "persona": current_persona}
-
-# ---------------- Background workers (every 1 minute) ----------------
-def self_learning_worker(interval_seconds: int = 60):
-    while True:
-        try:
-            net_ping()
-
-            with _state_lock:
-                st = load_state()
-                start_idx = int(st.get("last_seen_row", 1))
-
-            rows = read_new_rows_since(start_idx)
-            if rows:
-                snippets = []
-                for r in rows[-40:]:
-                    snippets.append(f"User: {r['query']}\nAlex: {r['reply']}")
-                corpus = "\n\n".join(snippets)[-8000:]
-
-                with _state_lock:
-                    persona_before = st.get("persona", DEFAULT_PERSONA)
-                upd = summarize_and_update_persona(corpus, persona_before)
-
-                with _state_lock:
-                    st = load_state()
-                    # prepend new notes then cap
-                    new_notes = upd["notes_texts"]
-                    for n in new_notes:
-                        db_add_note(n)
-                    st["notes"] = (new_notes + st.get("notes", []))[:80]
-                    st["persona"] = upd["persona"][:1600]
-                    st["last_seen_row"] = start_idx + len(rows)
-                    st["last_update_iso"] = datetime.now(timezone.utc).isoformat()
-                    save_state(st)
-                log.info("🧠 Self-learning pass complete.")
-
-            if SERPAPI_KEY:
-                items = fetch_news("technology")
-                if items:
-                    with _state_lock:
-                        st = load_state()
-                        st["last_news"] = items
-                        save_state(st)
-
-        except Exception as e:
-            log.error(f"Self-learning loop error: {e}")
-
-        time.sleep(max(10, int(interval_seconds)))  # ~60s cadence
-
-# ---------------- Tiny HTTP health server (Railway) ----------------
-async def handle_health(request):
-    return web.Response(text="ok")
-
-async def run_health_server():
-    app = web.Application()
-    app.add_routes([web.get("/health", handle_health), web.get("/", handle_health)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"🌐 Health server running on :{port}")
-
-# ---------------- Bot runner ----------------
-def build_bot_app() -> Application:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("ping",   cmd_ping))
-    app.add_handler(CommandHandler("net",    cmd_net))
-    app.add_handler(CommandHandler("ai",     cmd_ai))
-    app.add_handler(CommandHandler("imagine", cmd_imagine))   # images
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("learn",  cmd_learn))
-    app.add_handler(CommandHandler("resetmemory", cmd_resetmemory))
-    app.add_handler(CommandHandler("news",   cmd_news))
-    app.add_handler(CommandHandler("stats",  cmd_stats))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-    return app
-
-# ✅ Async polling without Updater.wait_until_idle (PTB v20+ safe)
-async def run_telegram_polling():
-    app = build_bot_app()
-    log.info("🚀 Alex is running (Telegram polling)...")
-
-    await app.initialize()
-    await app.start()
-
-    # Ensure we're not in webhook mode before polling
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        log.warning(f"delete_webhook warning: {e}")
-
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-    # Idle until SIGINT/SIGTERM
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            # e.g., on Windows or restricted environments
-            pass
-
-    await stop_event.wait()
-
-    # graceful shutdown
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-
-# ---------------- Main (with self-heal + background learning) ----------------
-def main():
-    # background learner (separate daemon thread)
-    t = threading.Thread(target=self_learning_worker, kwargs={"interval_seconds": 60}, daemon=True)
-    t.start()
-
-    async def orchestrate():
-        # Start health server (non-blocking) then Telegram polling
-        await run_health_server()
-        await run_telegram_polling()
-
-    # Use asyncio.run to ensure a proper event loop exists
-    try:
-        asyncio.run(orchestrate())
-    except KeyboardInterrupt:
-        log.info("🛑 Received keyboard interrupt — exiting.")
-    except SystemExit:
-        log.info("🛑 System exit requested.")
-    except Exception as e:
-        log.error(f"Fatal error: {e}", exc_info=True)
-
-if __name__ == "__main__":
-    main()
+   
