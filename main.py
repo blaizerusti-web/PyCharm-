@@ -1,12 +1,12 @@
-# ---------- Alex (all-in-one with keep-alive + uptime ping) ----------
+# ---------- Alex (all-in-one with keep-alive + uptime + "you there?") ----------
 import os, asyncio, logging, threading, time, requests
-from datetime import timedelta
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from duckduckgo_search import DDGS
 import feedparser
 import openai
+from datetime import datetime
 
 # --- Logging ---
 logging.basicConfig(
@@ -28,15 +28,17 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 RAILWAY_URL = os.getenv("RAILWAY_URL")  # e.g. https://your-app.up.railway.app
 openai.api_key = OPENAI_API_KEY
 
-# --- Uptime tracker ---
-START_TIME = time.time()
-
-def get_uptime():
-    uptime_seconds = int(time.time() - START_TIME)
-    return str(timedelta(seconds=uptime_seconds))
-
 # --- Telegram bot setup ---
 application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# --- Startup time (for uptime tracking) ---
+start_time = datetime.now()
+
+def get_uptime():
+    delta = datetime.now() - start_time
+    hours, remainder = divmod(int(delta.total_seconds()), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}h {minutes}m {seconds}s"
 
 # --- Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -83,24 +85,26 @@ async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"AI error: {e}")
         await update.message.reply_text("⚠️ AI request failed.")
 
-# --- Uptime ping: "you there?" ---
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uptime_str = get_uptime()
-    await update.message.reply_text(
-        f"Yep, I’m here and alive ✅\n⏱️ Uptime: {uptime_str}"
-    )
+# --- Custom "you there?" command ---
+async def you_there(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uptime = get_uptime()
+    responses = [
+        f"Yep, I’m here! ⏱️ Uptime: {uptime}",
+        f"Still awake 😎 (running {uptime})",
+        f"Always here for you 🚀 (uptime {uptime})"
+    ]
+    import random
+    await update.message.reply_text(random.choice(responses))
 
 # --- Handlers ---
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("search", search))
 application.add_handler(CommandHandler("rss", rss))
 application.add_handler(CommandHandler("ai", ai))
-
-# Custom "you there?" trigger
-application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^(?i)you there\?$"), status))
-
-# Default: any other text → AI
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai))
+
+# Trigger on exact text "you there?"
+application.add_handler(MessageHandler(filters.Regex(r"^you there\?$"), you_there))
 
 # --- Keep-alive (self-ping) ---
 def keep_alive():
@@ -115,11 +119,11 @@ def keep_alive():
         time.sleep(300)  # every 5 min
 
 # --- Hybrid runner ---
-async def main():
+def run():
     if RAILWAY_URL:  # 🚀 On Railway → webhook
         threading.Thread(target=keep_alive, daemon=True).start()
         logger.info("Running in WEBHOOK mode...")
-        await application.run_webhook(
+        application.run_webhook(
             listen="0.0.0.0",
             port=int(os.environ.get("PORT", 8443)),
             url_path=TELEGRAM_TOKEN,
@@ -127,10 +131,7 @@ async def main():
         )
     else:  # 🖥️ Local → polling
         logger.info("Running in POLLING mode...")
-        await application.run_polling()
+        application.run_polling()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+    run()
