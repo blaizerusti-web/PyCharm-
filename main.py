@@ -1,7 +1,7 @@
 # ---------- Alex (All-in-One: Natural Chat + Live Web + Memory + Self-Learning + Voice) ----------
-import os, sys, time, csv, json, threading, logging, tempfile, requests
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
+import os, sys, time, csv, json, threading, logging, tempfile, requests, re
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from openai import OpenAI
@@ -47,6 +47,9 @@ DEFAULT_STATE: Dict[str, Any] = {
     "last_news": [],      # cached recent news items
     "last_update_iso": None,
     "last_seen_row": 1,   # first data row in CSV is index 1
+    "net_ok": False,
+    "last_net_check": None,
+    "last_net_ms": None
 }
 
 _state_lock = threading.Lock()
@@ -85,6 +88,28 @@ def log_conversation(username: str, user_id: int, query: str, reply: str):
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([datetime.now(timezone.utc).isoformat(), username, user_id, query, reply])
 
+# ---------------- Live connectivity ping (no prompt needed) ----------------
+def net_ping() -> Dict[str, Optional[Any]]:
+    """Lightweight connectivity check; updates state with last ping status/latency."""
+    ok, ms = False, None
+    started = time.time()
+    try:
+        # ultra-cheap reachability check (no auth, tiny body)
+        r = requests.get("https://www.google.com/generate_204", timeout=6)
+        ok = (200 <= r.status_code < 400)
+        ms = int((time.time() - started) * 1000)
+    except Exception:
+        ok = False
+        ms = None
+
+    with _state_lock:
+        st = load_state()
+        st["net_ok"] = bool(ok)
+        st["last_net_check"] = datetime.now(timezone.utc).isoformat()
+        st["last_net_ms"] = ms
+        save_state(st)
+    return {"ok": ok, "ms": ms}
+
 # ---------------- Web Search / News (SerpAPI) ----------------
 def search_google(query: str) -> str:
     if not SERPAPI_KEY:
@@ -121,6 +146,45 @@ def fetch_news(topic: str = "technology") -> List[Dict[str, str]]:
     except Exception as e:
         log.error(f"News fetch error: {e}")
         return []
+
+# --------------- Heuristic: should we auto-enrich with web? (no prompt needed) ---------------
+WEB_TRIGGERS = re.compile(
+    r"\b(today|now|current|latest|breaking|price|stock|score|weather|news|update|live|"
+    r"this week|this month|tonight|forecast|release|launched|announced|earnings|who won|"
+    r"when is|schedule|deadline|trending|reddit|twitter|x\.com)\b",
+    re.IGNORECASE,
+)
+
+def should_web_enrich(text: str) -> bool:
+    # Trigger on recency words or if the text contains a proper question w/ entity
+    if WEB_TRIGGERS.search(text):
+        return True
+    if "http://" in text or "https://" in text:
+        return True
+    # simple heuristic: capitalized word + question mark
+    if "?" in text and re.search(r"[A-Z][a-z]{2,}\s", text):
+        return True
+    return False
+
+def auto_web_enrich(text: str) -> Optional[str]:
+    """If configured, run a quick search and return a short digest to prepend to the AI reply."""
+    if not SERPAPI_KEY:
+        return None
+    try:
+        res = requests.get(
+            "https://serpapi.com/search.json",
+            params={"q": text, "api_key": SERPAPI_KEY, "num": 5},
+            timeout=15,
+        )
+        j = res.json()
+        items = (j.get("organic_results") or [])[:3]
+        if not items:
+            return None
+        bullets = [f"- {it.get('title','(untitled)')} — {it.get('link','')}" for it in items]
+        return "🌐 Web (auto):\n" + "\n".join(bullets)
+    except Exception as e:
+        log.warning(f"Auto-enrich failed: {e}")
+        return None
 
 # ---------------- Prompt construction ----------------
 def build_system_prompt() -> str:
@@ -181,15 +245,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Alive. Uptime {get_uptime()}")
 
+async def cmd_net(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with _state_lock:
+        st = load_state()
+    ok = "✅" if st.get("net_ok") else "❌"
+    ms = st.get("last_net_ms")
+    ts = st.get("last_net_check")
+    await update.message.reply_text(f"{ok} Net: {ms if ms is not None else '-'} ms | last check: {ts or '-'}")
+
 async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("What should we think about? 🙂  Example: `/ai best laptop under 1k`")
         return
     q = " ".join(context.args)
+    prefix = auto_web_enrich(q) if should_web_enrich(q) else None
     reply = gpt_reply(q)
-    await update.message.reply_text(reply)
+    final = f"{prefix}\n\n{reply}" if prefix else reply
+    await update.message.reply_text(final)
     u = update.message.from_user
-    log_conversation(u.username or "Unknown", u.id, q, reply)
+    log_conversation(u.username or "Unknown", u.id, q, final)
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with _state_lock:
@@ -248,7 +322,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Always here 👊 (uptime {get_uptime()})")
         return
 
-    # search
+    # search (manual)
     if text.lower().startswith("search "):
         q = text[7:].strip()
         await update.message.reply_text(search_google(q))
@@ -264,10 +338,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tts_send(update, phrase)
         return
 
+    # auto web enrichment when useful (no prompt required)
+    prefix = auto_web_enrich(text) if should_web_enrich(text) else None
+
     # normal, natural AI reply (with memory/persona)
     reply = gpt_reply(text)
-    await update.message.reply_text(reply)
-    log_conversation(username, u.id, text, reply)
+    final = f"{prefix}\n\n{reply}" if prefix else reply
+    await update.message.reply_text(final)
+    log_conversation(username, u.id, text, final)
 
 # ---------------- Error handler ----------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -275,7 +353,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(update, Update) and update.message:
         await update.message.reply_text("Something glitched, but I’m back.")
 
-# ---------------- Self-Learning Loop ----------------
+# ---------------- Self-Learning Utilities ----------------
 def read_new_rows_since(idx_start: int) -> List[Dict[str, str]]:
     rows = []
     try:
@@ -310,22 +388,13 @@ def summarize_and_update_persona(notes_text: str, current_persona: str) -> Dict[
         )
         text = resp.choices[0].message.content.strip()
 
-        # very lightweight parsing: expect sections "Notes:" and "Persona update:"
         notes, new_persona = [], current_persona
-        # split lines; treat leading dash as bullet
         for line in text.splitlines():
             s = line.strip(" •-").strip()
-            if not s:
+            if not s or s.lower().startswith(("persona", "notes")):
                 continue
-            if s.lower().startswith("persona"):
-                # the next non-empty lines become persona suggestions
-                continue
-            if s.lower().startswith("notes"):
-                continue
-            # If the model returned a paragraph, accept as note.
             notes.append(s)
 
-        # If the model also suggested an updated persona as a single paragraph, keep last paragraph
         if "\n\n" in text:
             chunks = [c.strip() for c in text.split("\n\n") if c.strip()]
             if len(chunks) >= 2:
@@ -336,23 +405,27 @@ def summarize_and_update_persona(notes_text: str, current_persona: str) -> Dict[
         log.error(f"Self-learning summary error: {e}")
         return {"notes_texts": [], "persona": current_persona}
 
-def self_learning_worker(interval_minutes: int = 30):
+# ---------------- Background workers (every 1 minute) ----------------
+def self_learning_worker(interval_seconds: int = 60):
     """
-    Runs forever in a background thread:
+    Runs forever in a background thread (every ~1 minute):
     - reads new log rows
     - summarizes key takeaways
     - updates notes/persona
     - fetches and caches news
+    - pings network to keep access alive
     """
     while True:
         try:
+            # keep internet connection 'warm'
+            net_ping()
+
             with _state_lock:
                 st = load_state()
                 start_idx = int(st.get("last_seen_row", 1))
-            rows = read_new_rows_since(start_idx)
 
+            rows = read_new_rows_since(start_idx)
             if rows:
-                # Build small corpus
                 snippets = []
                 for r in rows[-40:]:
                     snippets.append(f"User: {r['query']}\nAlex: {r['reply']}")
@@ -371,7 +444,7 @@ def self_learning_worker(interval_minutes: int = 30):
                     save_state(st)
                 log.info("🧠 Self-learning pass complete.")
 
-            # Update news cache occasionally
+            # refresh a small tech news cache periodically (cheap)
             if SERPAPI_KEY:
                 items = fetch_news("technology")
                 if items:
@@ -383,7 +456,7 @@ def self_learning_worker(interval_minutes: int = 30):
         except Exception as e:
             log.error(f"Self-learning loop error: {e}")
 
-        time.sleep(max(60, int(interval_minutes * 60)))
+        time.sleep(max(10, int(interval_seconds)))  # ~60s cadence
 
 # ---------------- Bot runner ----------------
 def run_bot():
@@ -391,6 +464,7 @@ def run_bot():
 
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("ping",   cmd_ping))
+    app.add_handler(CommandHandler("net",    cmd_net))
     app.add_handler(CommandHandler("ai",     cmd_ai))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("learn",  cmd_learn))
@@ -404,8 +478,8 @@ def run_bot():
 
 # ---------------- Main (with self-heal + background learning) ----------------
 def main():
-    # spawn background learner
-    t = threading.Thread(target=self_learning_worker, kwargs={"interval_minutes": 30}, daemon=True)
+    # spawn background learner (every 60s)
+    t = threading.Thread(target=self_learning_worker, kwargs={"interval_seconds": 60}, daemon=True)
     t.start()
 
     while True:
