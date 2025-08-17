@@ -1,10 +1,9 @@
-python-telegram-bot==20.3
-Flask==3.0.3
-requests==2.32.3
-beautifulsoup4==4.12.3
-duckduckgo-search==2.9.4
-google-api-python-client==2.137.0
-google-auth==2.33.0
-google-auth-httplib2==0.2.0
-openai==0.28.1   # keeps your current ChatCompletion code working
-python-telegram-bot[job-queue]
+flask
+requests
+beautifulsoup4
+duckduckgo-search
+python-telegram-bot
+google-api-python-client
+google-auth
+google-auth-oauthlib
+openai
