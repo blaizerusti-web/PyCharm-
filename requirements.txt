@@ -2,7 +2,7 @@ flask
 requests
 beautifulsoup4
 duckduckgo-search
-python-telegram-bot[webhooks]>=20.0
+python-telegram-bot==20.6
 google-api-python-client
 google-auth
 google-auth-oauthlib
