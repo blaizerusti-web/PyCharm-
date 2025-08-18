@@ -1,5 +1,5 @@
 # ---------- Alex (all-in-one, Railway-ready) ----------
-import os, sys, json, time, threading, socket, logging, requests, asyncio, aiohttp
+import os, sys, json, time, threading, socket, logging, requests, asyncio, aiohttp, subprocess
 from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime
@@ -9,10 +9,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
-# ---------- Logging ----------
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ---------- Environment ----------
+# Env
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
@@ -39,10 +39,8 @@ async def ask_ai(prompt: str, context: str = "") -> str:
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": context or "You are Alex, helpful, witty, always on."},
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role":"system","content": context or "You are Alex, helpful, witty, always on."},
+                      {"role":"user","content": prompt}],
             max_tokens=500
         )
         return resp.choices[0].message.content.strip()
@@ -60,7 +58,7 @@ async def fetch_url(url: str) -> str:
                 text = await r.text()
                 soup = BeautifulSoup(text, "html.parser")
                 title = soup.title.string.strip() if soup.title else "No title"
-                desc = (soup.find("meta", {"name": "description"}) or {}).get("content", "")
+                desc = (soup.find("meta", {"name":"description"}) or {}).get("content","")
                 h1 = soup.h1.get_text(strip=True) if soup.h1 else ""
                 words = len(soup.get_text().split())
                 links = len(soup.find_all("a"))
@@ -75,76 +73,54 @@ async def fetch_url(url: str) -> str:
 
 async def analyze_url(url: str) -> str:
     content = await fetch_url(url)
-    if content.startswith("⚠️"):
-        return content
+    if content.startswith("⚠️"): return content
     summary = await ask_ai(f"Summarize and extract SEO notes:\n\n{content}")
     return summary
 
-# ---------- Telegram Commands ----------
+# ---------- Commands ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Hey, I'm Alex 🤖 Always on.")
 
 async def uptime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = int(time.time() - START_TIME)
-    h, m, s = u // 3600, (u % 3600) // 60, u % 60
+    u = int(time.time()-START_TIME)
+    h,m,s = u//3600, (u%3600)//60, u%60
     await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
 
 async def ai_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = " ".join(ctx.args)
-    if not q:
-        return await update.message.reply_text("Usage: /ai your question")
+    if not q: return await update.message.reply_text("Usage: /ai your question")
     ans = await ask_ai(q)
     await update.message.reply_text(ans)
 
 async def analyze_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Usage: /analyze <url>")
+    if not ctx.args: return await update.message.reply_text("Usage: /analyze <url>")
     url = ctx.args[0]
     await update.message.reply_text("🔍 Crawling...")
     result = await analyze_url(url)
     await update.message.reply_text(result)
 
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 *Alex Commands*\n\n"
-        "/start - Greet\n"
-        "/uptime - Show uptime\n"
-        "/ai <question> - Ask AI\n"
-        "/analyze <url> - Crawl & analyze a webpage\n"
-        "Type `search <query>` - Search via SERPAPI\n"
-        "Send a link - Auto analyze\n"
-        "Send text - AI response"
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-# ---------- Auto message handling ----------
+# ---------- Auto link + search ----------
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if not text:
-        return
-
-    # --- Search ---
+    if not text: return
     if text.lower().startswith("search "):
         query = text[7:]
         if not SERPAPI_KEY:
             return await update.message.reply_text("No SERPAPI_KEY set.")
         try:
-            r = requests.get("https://serpapi.com/search", params={"q": query, "hl": "en", "api_key": SERPAPI_KEY})
+            r = requests.get("https://serpapi.com/search", params={"q":query,"hl":"en","api_key":SERPAPI_KEY})
             j = r.json()
-            snippet = j.get("organic_results", [{}])[0].get("snippet", "(no results)")
+            snippet = j.get("organic_results",[{}])[0].get("snippet","(no results)")
             return await update.message.reply_text(f"🔎 {query}\n{snippet}")
         except Exception as e:
             return await update.message.reply_text(f"Error: {e}")
-
-    # --- URL analyze ---
     if text.startswith("http://") or text.startswith("https://"):
         await update.message.reply_text("🔍 Got your link — analyzing...")
         result = await analyze_url(text)
-        return await update.message.reply_text(result)
-
-    # --- Default: Ask AI ---
-    ans = await ask_ai(text)
-    await update.message.reply_text(ans)
+        await update.message.reply_text(result)
+    else:
+        ans = await ask_ai(text)
+        await update.message.reply_text(ans)
 
 # ---------- Self-learning worker ----------
 def learning_worker():
@@ -154,8 +130,8 @@ def learning_worker():
                 snippet = " ".join(memory["history"][-5:])
                 persona_update = client.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=[{"role": "system", "content": "Update persona from last lines"},
-                              {"role": "user", "content": snippet}]
+                    messages=[{"role":"system","content":"Update persona from last lines"},
+                              {"role":"user","content": snippet}]
                 ).choices[0].message.content
                 memory["persona"]["notes"] = persona_update
                 save_memory()
@@ -163,13 +139,11 @@ def learning_worker():
             logging.error(f"Learning error {e}")
         time.sleep(60)
 
-# ---------- Healthcheck ----------
+# ---------- Health server ----------
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
+        self.send_response(200); self.end_headers()
         self.wfile.write(b"ok")
-
 def run_health():
     HTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
@@ -180,7 +154,6 @@ def main():
     app.add_handler(CommandHandler("uptime", uptime))
     app.add_handler(CommandHandler("ai", ai_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     threading.Thread(target=learning_worker, daemon=True).start()
