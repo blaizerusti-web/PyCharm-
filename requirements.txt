@@ -9,3 +9,4 @@ google-auth-oauthlib
 openai
 feedparser
 aiohttp
+pandas
