@@ -10,17 +10,21 @@
 # - File analyzers: Excel (.xlsx), CSV, JSON  + memory ingest
 # - Image ingest: OCR (if available) + EXIF metadata + memory ingest
 # - Live log watcher (/setlog, /subscribe_logs, /logs) + trade-line summarizer
+# - Persona auto-learning worker (distills recent notes into guidance)
 # - Health server for Railway (PORT; default 8080)
-# - Auto-install deps on boot
+# - Auto-install deps on boot (be patient on first run)
 #
-# Env:
-# - TELEGRAM_TOKEN, OPENAI_API_KEY (required)
-# - SERPAPI_KEY (optional, /search)
+# Env (required):
+# - TELEGRAM_TOKEN, OPENAI_API_KEY
+#
+# Env (optional):
+# - SERPAPI_KEY (enables /search)
 # - PORT (default 8080)
-# - HUMANE_TONE=1 to capture tone
+# - HUMANE_TONE=1 to capture tone in summaries (default 1)
+# - OPENAI_MODEL (default gpt-4o-mini)
 # =========================
 
-import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math
+import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile
 from pathlib import Path
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -41,9 +45,10 @@ t_ext    = _ensure("telegram.ext", "python-telegram-bot==20.*")
 telegram = _ensure("telegram")
 _ensure("openai")
 _ensure("pandas")
-_ensure("openpyxl")  # reader for xlsx
-# image libs (optional OCR)
+_ensure("openpyxl")  # Excel reader
 _ensure("PIL", "Pillow")
+
+# Optional OCR (requires OS tesseract binary)
 try:
     _ensure("pytesseract")
     HAS_TESS = True
@@ -52,7 +57,7 @@ except Exception:
 
 from PIL import Image, ExifTags
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pandas as pd
 
@@ -63,6 +68,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 SERPAPI_KEY    = os.getenv("SERPAPI_KEY", "").strip()
 PORT           = int(os.getenv("PORT", "8080"))
 HUMANE_TONE    = os.getenv("HUMANE_TONE", "1") == "1"
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not TELEGRAM_TOKEN:
     logging.warning("TELEGRAM_TOKEN not set.")
@@ -81,14 +87,14 @@ def _make_ai():
     try:
         from openai import OpenAI
         cli = OpenAI(api_key=OPENAI_API_KEY)
-        def chat(messages, model="gpt-4o-mini", max_tokens=800):
+        def chat(messages, model=OPENAI_MODEL, max_tokens=800):
             r = cli.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
             return r.choices[0].message.content.strip()
         return chat
     except Exception:
         import openai as _openai
         _openai.api_key = OPENAI_API_KEY
-        def chat(messages, model="gpt-4o-mini", max_tokens=800):
+        def chat(messages, model=OPENAI_MODEL, max_tokens=800):
             r = _openai.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens)
             return r["choices"][0]["message"]["content"].strip()
         return chat
@@ -394,7 +400,6 @@ def analyze_excel(path: Path) -> str:
         num = df.select_dtypes(include="number")
         if not num.empty:
             info += "\n\nNumeric summary:\n" + num.describe().to_string()[:1800]
-        # memory
         log_raw("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file": str(path)})
         remember("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
         return info
@@ -441,7 +446,6 @@ def _exif_dict(im: Image.Image) -> dict:
     try:
         exif = im._getexif() or {}
         label = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
-        # Keep only a few human bits
         keep = {}
         for k in ["DateTime","Make","Model","Software","LensModel","Orientation","ExifVersion","XResolution","YResolution"]:
             if k in label: keep[k] = label[k]
@@ -464,9 +468,7 @@ def analyze_image(path: Path) -> str:
                 ocr_text = f"(OCR unavailable: {e})"
         else:
             ocr_text = "(OCR module not installed)"
-        # Log raw with full meta + ocr text separately for max detail
         rid = log_raw("image", ocr_text if ocr_text else "(no OCR text)", meta)
-        # Summarise insight for recall (while raw keeps max detail)
         gist = f"Image {path.name}: EXIF {exif if exif else '∅'}; OCR preview: {(ocr_text[:500]+'…') if ocr_text and len(ocr_text)>500 else (ocr_text or '∅')}"
         remember("image", gist, raw_ref=str(path))
         return f"🖼️ Image saved. EXIF keys: {list(exif.keys()) if exif else 'none'}. OCR length: {len(ocr_text)} chars. (raw id {rid})"
@@ -502,10 +504,9 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "I keep a perfect raw log and recall with concise insights.\n\n"
         "Core: /ask <question> (smart recall)\n"
         "Ingest: /analyze <url>, send images & .xlsx/.csv/.json files\n"
-        "Memory: /remember <text>, /mem [n], /exportmem\n"
-        "Raw log: /raw [n]\n"
-        "Logs: /setlog <path>, /subscribe_logs, /logs [n]\n"
-        "Utils: /ai <prompt>, /search <query>, /id, /uptime"
+        "Memory: /remember <text>, /mem [n], /exportmem, /raw [n]\n"
+        "Logs: /setlog <path>, /subscribe_logs, /unsubscribe_logs, /logs [n]\n"
+        "Utils: /ai <prompt>, /search <query>, /id, /uptime, /backup, /config"
     )
 
 async def id_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -514,6 +515,35 @@ async def id_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def uptime_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = int(time.time()-START_TIME); h,m,s = u//3600,(u%3600)//60,u%60
     await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
+
+async def config_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    flags = {
+        "MODEL": OPENAI_MODEL,
+        "HUMANE_TONE": HUMANE_TONE,
+        "HAS_TESS": HAS_TESS,
+        "SERPAPI_KEY_set": bool(SERPAPI_KEY),
+        "DB_PATH": DB_PATH,
+        "SAVE_DIR": str(SAVE_DIR),
+        "PORT": PORT,
+    }
+    await update.message.reply_text("Config:\n" + json.dumps(flags, indent=2))
+
+async def backup_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Creates a zip archive of the DB + JSONL + received_files/ manifest for backup.
+    """
+    try:
+        zpath = Path("alex_backup.zip")
+        with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            if Path(DB_PATH).exists(): z.write(DB_PATH)
+            if RAW_JSONL.exists(): z.write(RAW_JSONL)
+            manifest = {"files":[str(p) for p in SAVE_DIR.glob("*") if p.is_file()]}
+            man_path = Path("received_manifest.json")
+            man_path.write_text(json.dumps(manifest, indent=2))
+            z.write(man_path)
+        await update.message.reply_document(document=str(zpath), filename=zpath.name)
+    except Exception as e:
+        await update.message.reply_text(f"Backup error: {e}")
 
 async def ai_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = " ".join(ctx.args)
@@ -643,7 +673,7 @@ async def unsubscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         MEM_RUNTIME["subscribers"].remove(cid)
     await update.message.reply_text("🔕 Unsubscribed.")
 
-# --- generic text (and link autodetect) ---
+# --- text messages ---
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     log_raw("chat_user", text, {"chat_id": update.effective_chat.id})
@@ -664,7 +694,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log_raw("chat_alex", ans, {"chat_id": update.effective_chat.id})
     await update.message.reply_text(ans)
 
-# --- file uploads (Excel/CSV/JSON & generic) ---
+# --- document uploads (Excel/CSV/JSON/anything) ---
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc: return
@@ -674,37 +704,33 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log_raw("file", f"Received file {doc.file_name}", {"file": str(file_path), "chat_id": update.effective_chat.id})
     await update.message.reply_text(f"📂 Saved `{doc.file_name}` — analyzing…", parse_mode="Markdown")
 
-    fname = doc.file_name.lower()
+    name = doc.file_name.lower()
     out = ""
-    if fname.endswith(".xlsx"):
+    if name.endswith(".xlsx"):
         out = analyze_excel(file_path)
-    elif fname.endswith(".csv"):
+    elif name.endswith(".csv"):
         out = analyze_csv(file_path)
-    elif fname.endswith(".json"):
+    elif name.endswith(".json"):
         out = analyze_json(file_path)
-    elif fname.endswith((".png",".jpg",".jpeg",".webp",".bmp",".tif",".tiff")):
-        out = analyze_image(file_path)
     else:
         remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path))
-        out = "Saved. I currently analyze Excel (.xlsx), CSV, JSON, and images."
+        out = "Saved. I currently analyze Excel (.xlsx), CSV, and JSON."
     log_raw("chat_alex", out, {"chat_id": update.effective_chat.id})
     await update.message.reply_text(out)
 
-# --- photo uploads (Telegram photo field) ---
+# --- photo uploads (Telegram photos) ---
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    photos = update.message.photo
-    if not photos: return
-    best = photos[-1]  # highest resolution
-    f = await ctx.bot.get_file(best.file_id)
-    ts = int(time.time())
-    path = SAVE_DIR / f"photo_{ts}.jpg"
-    await f.download_to_drive(path)
-    log_raw("image", "Photo received", {"file": str(path), "chat_id": update.effective_chat.id})
+    if not update.message.photo: return
+    photo = update.message.photo[-1]  # highest resolution
+    file = await ctx.bot.get_file(photo.file_id)
+    fname = f"photo_{photo.file_id}.jpg"
+    path = SAVE_DIR / fname
+    await file.download_to_drive(path)
     out = analyze_image(path)
     log_raw("chat_alex", out, {"chat_id": update.effective_chat.id})
     await update.message.reply_text(out)
 
-# ---------- live log watcher push ----------
+# ---------- log watcher push ----------
 def _post_to_subscribers(text: str):
     if not GLOBAL_APP or not MEM_RUNTIME.get("subscribers"): return
     loop = GLOBAL_APP.bot._application.loop
@@ -798,6 +824,8 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("uptime", uptime_cmd))
+    app.add_handler(CommandHandler("config", config_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("ai", ai_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
