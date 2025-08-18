@@ -1,4 +1,4 @@
-# ---------- Alex (all-in-one, Railway-ready) ----------
+# ---------- Alex (all-in-one, Railway-ready with File Analysis) ----------
 import os, sys, json, time, threading, socket, logging, requests, asyncio, aiohttp, subprocess
 from pathlib import Path
 from typing import List, Dict, Any
@@ -8,6 +8,8 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
+import pandas as pd
+import random
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -99,10 +101,23 @@ async def analyze_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     result = await analyze_url(url)
     await update.message.reply_text(result)
 
-# ---------- Auto link + search ----------
+# ---------- Handle messages ----------
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if not text: return
+
+    # Wake-up trigger
+    if text.strip().lower() == "analyse alex_profile":
+        replies = [
+            "Let's get back to it.",
+            "Alright, I'm here — let's dive in.",
+            "Back in the zone.",
+            "Let's pick up where we left off.",
+            "Okay, ready to roll."
+        ]
+        return await update.message.reply_text(random.choice(replies))
+
+    # Search command
     if text.lower().startswith("search "):
         query = text[7:]
         if not SERPAPI_KEY:
@@ -114,13 +129,39 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text(f"🔎 {query}\n{snippet}")
         except Exception as e:
             return await update.message.reply_text(f"Error: {e}")
+
+    # Auto URL analysis
     if text.startswith("http://") or text.startswith("https://"):
         await update.message.reply_text("🔍 Got your link — analyzing...")
         result = await analyze_url(text)
-        await update.message.reply_text(result)
+        return await update.message.reply_text(result)
+
+    # Default: AI answer
+    ans = await ask_ai(text)
+    await update.message.reply_text(ans)
+
+# ---------- Handle file uploads ----------
+SAVE_DIR = Path("received_files")
+SAVE_DIR.mkdir(exist_ok=True)
+
+async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    document = update.message.document
+    file_path = SAVE_DIR / document.file_name
+
+    # Save file
+    new_file = await ctx.bot.get_file(document.file_id)
+    await new_file.download_to_drive(file_path)
+    await update.message.reply_text(f"📂 Got your file: {document.file_name}, analyzing...")
+
+    if document.file_name.endswith(".xlsx"):
+        try:
+            df = pd.read_excel(file_path)
+            summary = f"✅ Excel loaded: {df.shape[0]} rows × {df.shape[1]} columns."
+            await update.message.reply_text(summary)
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Error analyzing Excel: {e}")
     else:
-        ans = await ask_ai(text)
-        await update.message.reply_text(ans)
+        await update.message.reply_text("File saved, but I can only analyze Excel right now.")
 
 # ---------- Self-learning worker ----------
 def learning_worker():
@@ -154,6 +195,7 @@ def main():
     app.add_handler(CommandHandler("uptime", uptime))
     app.add_handler(CommandHandler("ai", ai_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     threading.Thread(target=learning_worker, daemon=True).start()
@@ -163,4 +205,4 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main(
+    main()
