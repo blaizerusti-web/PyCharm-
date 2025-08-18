@@ -7,7 +7,8 @@
 # - Humane Summaries “mind”: SQLite notes (summarize → tag → (optional) merge/evolve)
 # - RAG-style recall: /ask <question> searches full memory (raw + summaries) and answers with insights
 # - URL crawler + SEO summarize + memory ingest
-# - Excel analyzer (.xlsx) + memory ingest
+# - File analyzers: Excel (.xlsx), CSV, JSON  + memory ingest
+# - Image ingest: OCR (if available) + EXIF metadata + memory ingest
 # - Live log watcher (/setlog, /subscribe_logs, /logs) + trade-line summarizer
 # - Health server for Railway (PORT; default 8080)
 # - Auto-install deps on boot
@@ -41,7 +42,15 @@ telegram = _ensure("telegram")
 _ensure("openai")
 _ensure("pandas")
 _ensure("openpyxl")  # reader for xlsx
+# image libs (optional OCR)
+_ensure("PIL", "Pillow")
+try:
+    _ensure("pytesseract")
+    HAS_TESS = True
+except Exception:
+    HAS_TESS = False
 
+from PIL import Image, ExifTags
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -59,6 +68,10 @@ if not TELEGRAM_TOKEN:
     logging.warning("TELEGRAM_TOKEN not set.")
 if not OPENAI_API_KEY:
     logging.warning("OPENAI_API_KEY not set.")
+if HAS_TESS:
+    logging.info("OCR: pytesseract module present. (Tesseract binary must be installed in OS to work.)")
+else:
+    logging.info("OCR: pytesseract not available; images will be stored with EXIF only.")
 
 START_TIME = time.time()
 SAVE_DIR = Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
@@ -100,9 +113,9 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS raw_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
-  type TEXT NOT NULL,     -- chat_user, chat_alex, link, file, log, system
+  type TEXT NOT NULL,     -- chat_user, chat_alex, link, file, image, log, system
   text TEXT NOT NULL,
-  meta TEXT               -- JSON string with extras (url, file path, chat id, etc.)
+  meta TEXT               -- JSON string with extras (url, file path, chat id, exif, ocr, etc.)
 );
 """)
 cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_events(ts);")
@@ -112,7 +125,7 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS notes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
-  source TEXT NOT NULL,     -- 'chat' | 'link' | 'file' | 'log' | 'system'
+  source TEXT NOT NULL,     -- 'chat' | 'link' | 'file' | 'image' | 'log' | 'system'
   topic_key TEXT NOT NULL,  -- hashed topic key for merging/evolving
   title TEXT,
   content TEXT NOT NULL,
@@ -275,7 +288,7 @@ def search_memory(query: str, k_raw: int = 12, k_notes: int = 12) -> dict:
     qtf = _tf(_tokenize(query))
 
     # search raw
-    cur.execute("SELECT id, ts, type, text, meta FROM raw_events ORDER BY id DESC LIMIT 2000")
+    cur.execute("SELECT id, ts, type, text, meta FROM raw_events ORDER BY id DESC LIMIT 4000")
     raw_rows = cur.fetchall()
     raw_scored = []
     for r in raw_rows:
@@ -287,7 +300,7 @@ def search_memory(query: str, k_raw: int = 12, k_notes: int = 12) -> dict:
     raw_top = [x[1] for x in raw_scored[:k_raw]]
 
     # search notes
-    cur.execute("SELECT id, ts, source, title, content, tags, sentiment, raw_ref FROM notes ORDER BY id DESC LIMIT 2000")
+    cur.execute("SELECT id, ts, source, title, content, tags, sentiment, raw_ref FROM notes ORDER BY id DESC LIMIT 4000")
     note_rows = cur.fetchall()
     notes_scored = []
     for r in note_rows:
@@ -372,7 +385,7 @@ async def analyze_url(url: str) -> str:
     remember("link", summary, raw_ref=url)
     return summary
 
-# ---------- Excel analyzer ----------
+# ---------- File analyzers ----------
 def analyze_excel(path: Path) -> str:
     try:
         df = pd.read_excel(path)
@@ -387,6 +400,79 @@ def analyze_excel(path: Path) -> str:
         return info
     except Exception as e:
         return f"⚠️ Excel analysis error: {e}"
+
+def analyze_csv(path: Path) -> str:
+    try:
+        df = pd.read_csv(path, nrows=50000)  # guard
+        head_cols = ", ".join(map(str, list(df.columns)[:12]))
+        info = f"✅ CSV loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head_cols}"
+        num = df.select_dtypes(include="number")
+        if not num.empty:
+            info += "\n\nNumeric summary:\n" + num.describe().to_string()[:1800]
+        log_raw("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file": str(path)})
+        remember("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
+        return info
+    except Exception as e:
+        return f"⚠️ CSV analysis error: {e}"
+
+def analyze_json(path: Path) -> str:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+        data = json.loads(raw)
+        shape = ""
+        if isinstance(data, list):
+            shape = f"list[{len(data)}]"
+            preview = json.dumps(data[:3], ensure_ascii=False)[:1500]
+        elif isinstance(data, dict):
+            shape = f"dict({len(data.keys())} keys)"
+            preview = json.dumps({k:data[k] for k in list(data.keys())[:10]}, ensure_ascii=False)[:1500]
+        else:
+            shape = type(data).__name__
+            preview = str(data)[:1500]
+        info = f"✅ JSON loaded: {shape}\nPreview: {preview}"
+        log_raw("file", f"JSON {path.name}: shape {shape}", {"file": str(path)})
+        remember("file", f"JSON {path.name}: shape {shape}\nPreview: {preview}", raw_ref=str(path))
+        return info
+    except Exception as e:
+        return f"⚠️ JSON analysis error: {e}"
+
+# ---------- Image analyzer (OCR + EXIF) ----------
+def _exif_dict(im: Image.Image) -> dict:
+    try:
+        exif = im._getexif() or {}
+        label = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+        # Keep only a few human bits
+        keep = {}
+        for k in ["DateTime","Make","Model","Software","LensModel","Orientation","ExifVersion","XResolution","YResolution"]:
+            if k in label: keep[k] = label[k]
+        return keep
+    except Exception:
+        return {}
+
+def analyze_image(path: Path) -> str:
+    meta = {"file": str(path)}
+    try:
+        im = Image.open(path)
+        exif = _exif_dict(im)
+        meta["exif"] = exif
+        ocr_text = ""
+        if HAS_TESS:
+            try:
+                import pytesseract
+                ocr_text = pytesseract.image_to_string(im) or ""
+            except Exception as e:
+                ocr_text = f"(OCR unavailable: {e})"
+        else:
+            ocr_text = "(OCR module not installed)"
+        # Log raw with full meta + ocr text separately for max detail
+        rid = log_raw("image", ocr_text if ocr_text else "(no OCR text)", meta)
+        # Summarise insight for recall (while raw keeps max detail)
+        gist = f"Image {path.name}: EXIF {exif if exif else '∅'}; OCR preview: {(ocr_text[:500]+'…') if ocr_text and len(ocr_text)>500 else (ocr_text or '∅')}"
+        remember("image", gist, raw_ref=str(path))
+        return f"🖼️ Image saved. EXIF keys: {list(exif.keys()) if exif else 'none'}. OCR length: {len(ocr_text)} chars. (raw id {rid})"
+    except Exception as e:
+        log_raw("image", f"Image load error {path.name}: {e}", {"file": str(path)})
+        return f"⚠️ Image analysis error: {e}"
 
 # ---------- Trading log parsing (generic) ----------
 TRADE_PATTERNS = [
@@ -413,9 +499,9 @@ MEM_RUNTIME = {"log_path":"", "subscribers": []}  # runtime prefs
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hey, I'm Alex 🤖\n"
-        "Ask me anything, I remember everything.\n\n"
+        "I keep a perfect raw log and recall with concise insights.\n\n"
         "Core: /ask <question> (smart recall)\n"
-        "Ingest: /analyze <url>, send .xlsx files\n"
+        "Ingest: /analyze <url>, send images & .xlsx/.csv/.json files\n"
         "Memory: /remember <text>, /mem [n], /exportmem\n"
         "Raw log: /raw [n]\n"
         "Logs: /setlog <path>, /subscribe_logs, /logs [n]\n"
@@ -522,48 +608,22 @@ async def raw_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = "\n".join(out_lines)
     await update.message.reply_text(msg[:3900])
 
-async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
+async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    n = 40
+    if ctx.args:
+        try: n = max(1, min(400, int(ctx.args[0])))
+        except: pass
+    path = MEM_RUNTIME.get("log_path") or ""
+    p = Path(path)
+    if not path or not p.exists():
+        return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
+    try:
+        lines = p.read_text(errors="ignore").splitlines()[-n:]
+        msg = "```\n" + "\n".join(lines)[-3500:] + "\n```"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Read error: {e}")
 
-    # Always raw-log user input
-    log_raw("chat_user", text, {"chat_id": update.effective_chat.id})
-
-    if text.lower() == "analyse alex_profile":
-        msg = "Back in the zone. What’s next?"
-        log_raw("chat_alex", msg, {"chat_id": update.effective_chat.id})
-        return await update.message.reply_text(msg)
-
-    if text.startswith("http://") or text.startswith("https://"):
-        await update.message.reply_text("🔍 Got your link — analyzing…")
-        res = await analyze_url(text)
-        log_raw("chat_alex", res, {"chat_id": update.effective_chat.id})
-        return await update.message.reply_text(res)
-
-    # default AI chat (and store summary + raw)
-    ans = await ask_ai(text)
-    remember("chat", f"User said: {text}\nResponse gist: {ans[:400]}")
-    log_raw("chat_alex", ans, {"chat_id": update.effective_chat.id})
-    await update.message.reply_text(ans)
-
-# --- file uploads (Excel) ---
-async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc: return
-    file_path = SAVE_DIR / doc.file_name
-    tg_file = await ctx.bot.get_file(doc.file_id)
-    await tg_file.download_to_drive(file_path)
-    log_raw("file", f"Received file {doc.file_name}", {"file": str(file_path), "chat_id": update.effective_chat.id})
-    await update.message.reply_text(f"📂 Saved `{doc.file_name}` — analyzing…", parse_mode="Markdown")
-
-    if doc.file_name.lower().endswith(".xlsx"):
-        out = analyze_excel(file_path)
-        log_raw("chat_alex", out, {"chat_id": update.effective_chat.id})
-        await update.message.reply_text(out)
-    else:
-        remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path))
-        await update.message.reply_text("Saved. I currently analyze Excel (.xlsx).")
-
-# --- log watcher commands ---
 async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         return await update.message.reply_text("Usage: /setlog /path/to/your.log")
@@ -583,23 +643,68 @@ async def unsubscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         MEM_RUNTIME["subscribers"].remove(cid)
     await update.message.reply_text("🔕 Unsubscribed.")
 
-async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    n = 40
-    if ctx.args:
-        try: n = max(1, min(400, int(ctx.args[0])))
-        except: pass
-    path = MEM_RUNTIME.get("log_path") or ""
-    p = Path(path)
-    if not path or not p.exists():
-        return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
-    try:
-        lines = p.read_text(errors="ignore").splitlines()[-n:]
-        msg = "```\n" + "\n".join(lines)[-3500:] + "\n```"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"Read error: {e}")
+# --- generic text (and link autodetect) ---
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    log_raw("chat_user", text, {"chat_id": update.effective_chat.id})
 
-# ---------- log watcher push ----------
+    if text.lower() == "analyse alex_profile":
+        msg = "Back in the zone. What’s next?"
+        log_raw("chat_alex", msg, {"chat_id": update.effective_chat.id})
+        return await update.message.reply_text(msg)
+
+    if text.startswith("http://") or text.startswith("https://"):
+        await update.message.reply_text("🔍 Got your link — analyzing…")
+        res = await analyze_url(text)
+        log_raw("chat_alex", res, {"chat_id": update.effective_chat.id})
+        return await update.message.reply_text(res)
+
+    ans = await ask_ai(text)
+    remember("chat", f"User said: {text}\nResponse gist: {ans[:400]}")
+    log_raw("chat_alex", ans, {"chat_id": update.effective_chat.id})
+    await update.message.reply_text(ans)
+
+# --- file uploads (Excel/CSV/JSON & generic) ---
+async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc: return
+    file_path = SAVE_DIR / doc.file_name
+    tg_file = await ctx.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(file_path)
+    log_raw("file", f"Received file {doc.file_name}", {"file": str(file_path), "chat_id": update.effective_chat.id})
+    await update.message.reply_text(f"📂 Saved `{doc.file_name}` — analyzing…", parse_mode="Markdown")
+
+    fname = doc.file_name.lower()
+    out = ""
+    if fname.endswith(".xlsx"):
+        out = analyze_excel(file_path)
+    elif fname.endswith(".csv"):
+        out = analyze_csv(file_path)
+    elif fname.endswith(".json"):
+        out = analyze_json(file_path)
+    elif fname.endswith((".png",".jpg",".jpeg",".webp",".bmp",".tif",".tiff")):
+        out = analyze_image(file_path)
+    else:
+        remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path))
+        out = "Saved. I currently analyze Excel (.xlsx), CSV, JSON, and images."
+    log_raw("chat_alex", out, {"chat_id": update.effective_chat.id})
+    await update.message.reply_text(out)
+
+# --- photo uploads (Telegram photo field) ---
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    photos = update.message.photo
+    if not photos: return
+    best = photos[-1]  # highest resolution
+    f = await ctx.bot.get_file(best.file_id)
+    ts = int(time.time())
+    path = SAVE_DIR / f"photo_{ts}.jpg"
+    await f.download_to_drive(path)
+    log_raw("image", "Photo received", {"file": str(path), "chat_id": update.effective_chat.id})
+    out = analyze_image(path)
+    log_raw("chat_alex", out, {"chat_id": update.effective_chat.id})
+    await update.message.reply_text(out)
+
+# ---------- live log watcher push ----------
 def _post_to_subscribers(text: str):
     if not GLOBAL_APP or not MEM_RUNTIME.get("subscribers"): return
     loop = GLOBAL_APP.bot._application.loop
@@ -708,6 +813,7 @@ def main():
 
     # messages
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     # background threads
