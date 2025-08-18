@@ -19,7 +19,7 @@
 # - HUMANE_TONE=1 to capture tone
 # =========================
 
-import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, html
+import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math
 from pathlib import Path
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -35,16 +35,17 @@ def _ensure(import_name: str, pip_name: str | None = None):
 
 requests = _ensure("requests")
 aiohttp  = _ensure("aiohttp")
-bs4      = _ensure("bs4", "beautifulsoup4")
+_ensure("bs4", "beautifulsoup4")
 t_ext    = _ensure("telegram.ext", "python-telegram-bot==20.*")
 telegram = _ensure("telegram")
-openai_m = _ensure("openai")
-pandas_m = _ensure("pandas")
+_ensure("openai")
+_ensure("pandas")
 _ensure("openpyxl")  # reader for xlsx
 
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import pandas as pd
 
 # ---------- config / logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -372,7 +373,6 @@ async def analyze_url(url: str) -> str:
     return summary
 
 # ---------- Excel analyzer ----------
-import pandas as pd
 def analyze_excel(path: Path) -> str:
     try:
         df = pd.read_excel(path)
@@ -520,7 +520,6 @@ async def raw_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         txt = r["text"].replace("\n"," ")[:800]
         out_lines.append(f"#{r['id']} [{r['ts']} | {r['type']}] {txt}{mtxt}")
     msg = "\n".join(out_lines)
-    # Telegram limit safe slice
     await update.message.reply_text(msg[:3900])
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
