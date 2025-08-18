@@ -1,4 +1,12 @@
-# =========================
+import subprocess, sys
+
+# Auto-install missing dependencies
+required = ["openpyxl", "pandas"]
+for package in required:
+    try:
+        __import__(package)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])# =========================
 # main.py  (Alex — all-in-one, Railway-ready)
 # =========================
 # Features:
