@@ -1,896 +1,193 @@
-# ---------- main.py | Alex (All-in-One: Natural Chat + Live Web + Memory + Self-Learning + Voice + Images + SQLite + Link Analyzer) ----------
-# Single-file, Railway-ready. Persistent storage, health server, Telegram bot (PTB v20+),
-# OpenAI (chat+TTS+images), SerpAPI enrichment, self-learning background worker,
-# simple config (startup visit counter), and URL analyzer (auto + /analyze).
-
-import os, sys, time, csv, json, threading, logging, tempfile, requests, re, asyncio, signal, sqlite3
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Tuple
-from urllib.parse import urlparse
-
+# ---------- Alex (all-in-one, Railway-ready) ----------
+import os, sys, json, time, threading, socket, logging, requests, asyncio, aiohttp
+from pathlib import Path
+from typing import List, Dict, Any
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
-from aiohttp import web
 
-# Optional HTML parsing (falls back gracefully if missing)
-try:
-    from bs4 import BeautifulSoup  # type: ignore
-    HAS_BS4 = True
-except Exception:
-    HAS_BS4 = False
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ---------------- Logging ----------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("alex")
-
-# ---------------- Keys / Client ----------------
+# ---------- Environment ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_KEY     = os.getenv("OPENAI_API_KEY")
-SERPAPI_KEY    = os.getenv("SERPAPI_KEY")  # optional for web search/news
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+PORT = int(os.getenv("PORT", "8080"))
 
-if not TELEGRAM_TOKEN:
-    sys.exit("❌ TELEGRAM_TOKEN not set in environment!")
-if not OPENAI_KEY:
-    sys.exit("❌ OPENAI_API_KEY not set in environment!")
+client = OpenAI(api_key=OPENAI_API_KEY)
+START_TIME = time.time()
 
-client = OpenAI(api_key=OPENAI_KEY)
-
-# ---------------- Data directory (Railway-friendly) ----------------
-def select_data_dir() -> str:
-    candidates = [
-        os.getenv("RAILWAY_VOLUME_MOUNT_PATH"),  # preferred if present
-        "/mnt/data",
-        "/data",
-        os.getcwd(),  # fallback
-    ]
-    for path in candidates:
-        if not path:
-            continue
-        try:
-            os.makedirs(path, exist_ok=True)
-            testfile = os.path.join(path, ".rw_test")
-            with open(testfile, "w", encoding="utf-8") as f:
-                f.write("ok")
-            os.remove(testfile)
-            return path
-        except Exception as e:
-            log.warning(f"Data dir candidate failed ({path}): {e}")
-            continue
-    return os.getcwd()
-
-DATA_DIR = select_data_dir()
-log.info(f"📁 Data directory: {DATA_DIR}")
-
-# ---------------- Config (simple persistent JSON) ----------------
-CONFIG_FILE = os.path.join(DATA_DIR, "alex_config.json")
-def load_config() -> Dict[str, Any]:
+# ---------- Memory ----------
+memory_file = Path("memory.json")
+if memory_file.exists():
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        log.warning(f"Config load issue: {e}")
-    return {}
+        memory = json.loads(memory_file.read_text())
+    except:
+        memory = {"persona": {}, "history": []}
+else:
+    memory = {"persona": {}, "history": []}
 
-def save_config(cfg: Dict[str, Any]) -> None:
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        log.error(f"Config save issue: {e}")
+def save_memory():
+    memory_file.write_text(json.dumps(memory, indent=2))
 
-config = load_config()
-config["visits"] = int(config.get("visits", 0)) + 1
-save_config(config)
-log.info(f"✅ Alex has been started {config['visits']} times (persistent).")
-
-# ---------------- Files (persisted) ----------------
-LOG_FILE   = os.path.join(DATA_DIR, "ai_conversations.csv")   # conversation transcript
-STATE_FILE = os.path.join(DATA_DIR, "alex_state.json")        # persona + long-term memory
-DB_FILE    = os.path.join(DATA_DIR, "alex.db")                # SQLite mirror
-
-# init CSV
-if not os.path.exists(LOG_FILE):
-    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["timestamp_utc", "username", "user_id", "query", "reply"])
-
-# ---------------- SQLite setup ----------------
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-_db = db_connect()
-_db_lock = threading.Lock()
-
-def db_init():
-    with _db_lock, _db:
-        _db.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_utc TEXT,
-            username TEXT,
-            user_id INTEGER,
-            query TEXT,
-            reply TEXT
-        )""")
-        _db.execute("""
-        CREATE TABLE IF NOT EXISTS kv (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
-        _db.execute("""
-        CREATE TABLE IF NOT EXISTS facts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT,
-            created_utc TEXT
-        )""")
-        _db.execute("""
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT,
-            created_utc TEXT
-        )""")
-
-db_init()
-
-def db_put_kv(key: str, value: str):
-    with _db_lock, _db:
-        _db.execute(
-            "INSERT INTO kv(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value)
-        )
-
-def db_get_kv(key: str, default: Optional[str] = None) -> Optional[str]:
-    with _db_lock:
-        cur = _db.execute("SELECT value FROM kv WHERE key=?", (key,))
-        row = cur.fetchone()
-        return row[0] if row else default
-
-def db_add_convo(ts: str, username: str, user_id: int, query: str, reply: str):
-    with _db_lock, _db:
-        _db.execute(
-            "INSERT INTO conversations(timestamp_utc, username, user_id, query, reply) VALUES(?,?,?,?,?)",
-            (ts, username, user_id, query, reply)
-        )
-
-def db_add_fact(text: str):
-    with _db_lock, _db:
-        _db.execute("INSERT INTO facts(text, created_utc) VALUES(?, ?)",
-                    (text, datetime.now(timezone.utc).isoformat()))
-
-def db_add_note(text: str):
-    with _db_lock, _db:
-        _db.execute("INSERT INTO notes(text, created_utc) VALUES(?, ?)",
-                    (text, datetime.now(timezone.utc).isoformat()))
-
-# ---------------- State (JSON + KV mirror) ----------------
-DEFAULT_PERSONA = (
-    "You are Alex: friendly, concise, curious, and helpful. "
-    "You answer naturally (like a smart friend), cite facts when relevant, "
-    "admit uncertainty, and prefer actionable steps. You avoid fluff."
-)
-DEFAULT_STATE: Dict[str, Any] = {
-    "persona": DEFAULT_PERSONA,
-    "facts": [],          # enduring facts about user/preferences/workflows
-    "notes": [],          # distilled takeaways from chats
-    "last_news": [],      # cached recent news items
-    "last_update_iso": None,
-    "last_seen_row": 1,   # first data row in CSV is index 1
-    "net_ok": False,
-    "last_net_check": None,
-    "last_net_ms": None
-}
-
-_state_lock = threading.Lock()
-
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
-        save_state(DEFAULT_STATE)
-        db_put_kv("persona", DEFAULT_PERSONA)
-        db_put_kv("last_seen_row", "1")
-        return DEFAULT_STATE.copy()
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for k, v in DEFAULT_STATE.items():
-            data.setdefault(k, v)
-        db_put_kv("persona", data.get("persona", DEFAULT_PERSONA))
-        db_put_kv("last_seen_row", str(data.get("last_seen_row", 1)))
-        return data
-    except Exception as e:
-        log.error(f"Failed to read state file: {e}")
-        persona = db_get_kv("persona", DEFAULT_PERSONA)
-        last_seen_row = int(db_get_kv("last_seen_row", "1"))
-        data = DEFAULT_STATE.copy()
-        data["persona"] = persona
-        data["last_seen_row"] = last_seen_row
-        return data
-
-def save_state(data: Dict[str, Any]) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        db_put_kv("persona", data.get("persona", DEFAULT_PERSONA))
-        db_put_kv("last_seen_row", str(data.get("last_seen_row", 1)))
-    except Exception as e:
-        log.error(f"Failed to write state file: {e}")
-
-# ---------------- Uptime ----------------
-start_time = time.time()
-def get_uptime():
-    s = int(time.time() - start_time)
-    h, r = divmod(s, 3600)
-    m, s = divmod(r, 60)
-    return f"{h}h {m}m {s}s"
-
-# ---------------- Conversation logging ----------------
-def log_conversation(username: str, user_id: int, query: str, reply: str):
-    ts = datetime.now(timezone.utc).isoformat()
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([ts, username, user_id, query, reply])
-    db_add_convo(ts, username, user_id, query, reply)
-
-# ---------------- Live connectivity ping (no prompt needed) ----------------
-def net_ping() -> Dict[str, Optional[Any]]:
-    ok, ms = False, None
-    started = time.time()
-    try:
-        r = requests.get("https://www.google.com/generate_204", timeout=6)
-        ok = (200 <= r.status_code < 400)
-        ms = int((time.time() - started) * 1000)
-    except Exception:
-        ok = False
-        ms = None
-
-    with _state_lock:
-        st = load_state()
-        st["net_ok"] = bool(ok)
-        st["last_net_check"] = datetime.now(timezone.utc).isoformat()
-        st["last_net_ms"] = ms
-        save_state(st)
-    return {"ok": ok, "ms": ms}
-
-# ---------------- Web Search / News (SerpAPI) ----------------
-def search_google(query: str) -> str:
-    if not SERPAPI_KEY:
-        return "⚠️ Web search isn't enabled yet (missing SERPAPI_KEY)."
-    try:
-        res = requests.get(
-            "https://serpapi.com/search.json",
-            params={"q": query, "api_key": SERPAPI_KEY},
-            timeout=15,
-        )
-        data = res.json()
-        items = (data.get("organic_results") or [])[:5]
-        if not items:
-            return "No strong results found."
-        lines = [f"- {it.get('title','(untitled)')} — {it.get('link','')}" for it in items]
-        return "🔎 Top results:\n" + "\n".join(lines)
-    except Exception as e:
-        return f"❌ Search failed: {e}"
-
-def fetch_news(topic: str = "technology") -> List[Dict[str, str]]:
-    if not SERPAPI_KEY:
-        return []
-    try:
-        res = requests.get(
-            "https://serpapi.com/search.json",
-            params={"engine": "google_news", "q": topic, "api_key": SERPAPI_KEY},
-            timeout=15,
-        )
-        data = res.json()
-        stories = []
-        for item in (data.get("news_results") or [])[:5]:
-            stories.append({"title": item.get("title", ""), "link": item.get("link", "")})
-        return stories
-    except Exception as e:
-        log.error(f"News fetch error: {e}")
-        return []
-
-# --------------- Heuristic: should we auto-enrich with web? (no prompt needed) ---------------
-WEB_TRIGGERS = re.compile(
-    r"\b(today|now|current|latest|breaking|price|stock|score|weather|news|update|live|"
-    r"this week|this month|tonight|forecast|release|launched|announced|earnings|who won|"
-    r"when is|schedule|deadline|trending|reddit|twitter|x\.com)\b",
-    re.IGNORECASE,
-)
-
-def should_web_enrich(text: str) -> bool:
-    if WEB_TRIGGERS.search(text):
-        return True
-    if "http://" in text or "https://" in text:
-        return True
-    if "?" in text and re.search(r"[A-Z][a-z]{2,}\s", text):
-        return True
-    return False
-
-def auto_web_enrich(text: str) -> Optional[str]:
-    if not SERPAPI_KEY:
-        return None
-    try:
-        res = requests.get(
-            "https://serpapi.com/search.json",
-            params={"q": text, "api_key": SERPAPI_KEY, "num": 5},
-            timeout=15,
-        )
-        j = res.json()
-        items = (j.get("organic_results") or [])[:3]
-        if not items:
-            return None
-        bullets = [f"- {it.get('title','(untitled)')} — {it.get('link','')}" for it in items]
-        return "🌐 Web (auto):\n" + "\n".join(bullets)
-    except Exception as e:
-        log.warning(f"Auto-enrich failed: {e}")
-        return None
-
-# ---------------- URL Utilities ----------------
-URL_RE = re.compile(r"(https?://[^\s<>]+)", re.IGNORECASE)
-
-def extract_urls(text: str) -> List[str]:
-    return URL_RE.findall(text or "")
-
-def is_probably_html(content_type: str) -> bool:
-    if not content_type:
-        return True
-    c = content_type.lower()
-    return ("text/html" in c) or ("application/xhtml" in c) or (c.startswith("text/") and "xml" not in c)
-
-def fetch_url(url: str, max_bytes: int = 1_200_000, timeout: int = 12) -> Tuple[int, Dict[str, str], bytes]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; AlexBot/1.0; +https://example.invalid/bot)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.7",
-    }
-    with requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True) as r:
-        status = r.status_code
-        # read up to max_bytes
-        buf = bytearray()
-        for chunk in r.iter_content(chunk_size=16384):
-            if chunk:
-                buf.extend(chunk)
-                if len(buf) >= max_bytes:
-                    break
-        return status, dict(r.headers or {}), bytes(buf)
-
-def strip_html_to_text(html: str) -> str:
-    if HAS_BS4:
-        soup = BeautifulSoup(html, "html.parser")
-        # remove script/style/noscript
-        for t in soup(["script", "style", "noscript"]):
-            t.decompose()
-        # Get title for later
-        title = (soup.title.string.strip() if soup.title and soup.title.string else "")
-        text = soup.get_text(separator="\n")
-        return (title + "\n\n" + text).strip()
-    # fallback: crude stripping
-    txt = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
-    txt = re.sub(r"(?is)<style.*?>.*?</style>", " ", txt)
-    txt = re.sub(r"(?s)<.*?>", " ", txt)
-    txt = re.sub(r"\s+\n", "\n", txt)
-    return txt.strip()
-
-def extract_meta(html: str) -> Dict[str, Any]:
-    meta: Dict[str, Any] = {"title": "", "description": "", "h1": [], "word_count": 0, "links": 0, "images": 0}
-    if not HAS_BS4:
-        # best-effort with regex
-        m = re.search(r"(?is)<title>(.*?)</title>", html)
-        if m: meta["title"] = re.sub(r"\s+", " ", m.group(1)).strip()
-        md = re.search(r'(?is)<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']', html)
-        if md: meta["description"] = re.sub(r"\s+", " ", md.group(1)).strip()
-        meta["word_count"] = len(re.findall(r"\w+", re.sub(r"(?s)<.*?>", " ", html)))
-        meta["links"] = len(re.findall(r"(?is)<a\s", html))
-        meta["images"] = len(re.findall(r"(?is)<img\s", html))
-        return meta
-
-    soup = BeautifulSoup(html, "html.parser")
-    meta["title"] = (soup.title.string.strip() if soup.title and soup.title.string else "")
-    md = soup.find("meta", attrs={"name": "description"})
-    if md and md.get("content"): meta["description"] = md["content"].strip()
-    meta["h1"] = [re.sub(r"\s+", " ", h.get_text(" ", strip=True)) for h in soup.find_all("h1")]
-    meta["word_count"] = len(soup.get_text(" ", strip=True).split())
-    meta["links"] = len(soup.find_all("a"))
-    meta["images"] = len(soup.find_all("img"))
-    return meta
-
-def summarize_text(text: str, url: str) -> str:
-    # Keep prompt tight; trim text to ~10k chars
-    snippet = text[:10000]
-    prompt = (
-        "You are Alex, a concise assistant. Summarize and analyze the web page content below.\n"
-        "Return:\n"
-        "1) 3–6 bullet key takeaways\n"
-        "2) What it’s for / who it helps\n"
-        "3) Potential issues or red flags\n"
-        "4) If relevant: quick SEO notes (title/description/H1 fit & keyword hints)\n\n"
-        f"Source: {url}\n\n"
-        f"Content:\n{snippet}"
-    )
+# ---------- AI core ----------
+async def ask_ai(prompt: str, context: str = "") -> str:
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0.4,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        log.error(f"OpenAI summarize error: {e}")
-        return "Couldn't run AI summary right now."
-
-def analyze_url(url: str) -> str:
-    try:
-        status, headers, raw = fetch_url(url)
-        ct = headers.get("Content-Type", "")
-        size_kb = int(len(raw) / 1024)
-        host = urlparse(url).netloc
-
-        if not (200 <= status < 400):
-            return f"🔎 `{url}`\nHTTP {status} — I couldn’t fetch readable content."
-
-        if "application/pdf" in ct.lower():
-            return (f"🔎 `{url}`\nContent-Type: PDF ({size_kb} KB). "
-                    f"I can’t reliably parse PDFs here. Download and paste text if you’d like analysis.")
-
-        # Assume HTML / text
-        enc = "utf-8"
-        m = re.search(r"charset=([A-Za-z0-9_\-]+)", ct or "", re.I)
-        if m:
-            enc = m.group(1).lower()
-        try:
-            html = raw.decode(enc, errors="ignore")
-        except Exception:
-            html = raw.decode("utf-8", errors="ignore")
-
-        text = strip_html_to_text(html)
-        meta = extract_meta(html)
-        title = meta.get("title") or host
-
-        # Build quick header with meta
-        meta_lines = []
-        if meta.get("title"): meta_lines.append(f"• Title: {meta['title'][:200]}")
-        if meta.get("description"): meta_lines.append(f"• Meta description: {meta['description'][:240]}")
-        if meta.get("h1"): meta_lines.append(f"• H1: {', '.join(meta['h1'][:3])[:240]}")
-        meta_lines.append(f"• Words: ~{meta.get('word_count', 0)} | Links: {meta.get('links', 0)} | Images: {meta.get('images', 0)}")
-
-        ai = summarize_text(text, url)
-
-        return (
-            f"🧭 Analyzed: {url}\n"
-            f"📄 {title}\n" +
-            ("\n".join(meta_lines) + "\n\n" if meta_lines else "") +
-            ai
-        )
-    except Exception as e:
-        log.error(f"analyze_url error: {e}")
-        return f"Couldn’t analyze that link. ({e})"
-
-# ---------------- Prompt construction ----------------
-def build_system_prompt() -> str:
-    with _state_lock:
-        st = load_state()
-        persona = st.get("persona", DEFAULT_PERSONA)
-        facts = st.get("facts", [])[:12]
-        notes = st.get("notes", [])[-12:]
-
-    blocks = [
-        persona,
-        "Use the following long-term memory when relevant:",
-        *[f"- {f}" for f in facts],
-        "Recent distilled notes:",
-        *[f"- {n}" for n in notes],
-        "Style: warm, direct, practical; avoid filler; prefer short paragraphs and lists; ask clarifying only when critical."
-    ]
-    return "\n".join(blocks)
-
-def gpt_reply(user_text: str) -> str:
-    system_prompt = build_system_prompt()
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.6,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
+                {"role": "system", "content": context or "You are Alex, helpful, witty, always on."},
+                {"role": "user", "content": prompt}
             ],
+            max_tokens=500
         )
-        return (resp.choices[0].message.content or "").strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        log.error(f"OpenAI error: {e}")
-        return "I hit a snag talking to my brain. Try again in a moment."
+        logging.error(f"AI error: {e}")
+        return f"(AI error: {e})"
 
-# ---------------- Voice (on demand with “alex say …”) ----------------
-async def tts_send(update: Update, text: str):
+# ---------- Web crawler ----------
+async def fetch_url(url: str) -> str:
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-            speech = client.audio.speech.create(
-                model="gpt-4o-mini-tts",
-                voice="alloy",
-                input=text[:4096],
-            )
-            data = getattr(speech, "content", None) or getattr(speech, "audio", None)
-            if not data:
-                raise RuntimeError("No audio bytes returned")
-            tmp.write(data)
-            path = tmp.name
-        with open(path, "rb") as f:
-            await update.message.reply_voice(f)
-        os.remove(path)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}) as r:
+                if r.status != 200:
+                    return f"⚠️ Failed ({r.status})"
+                text = await r.text()
+                soup = BeautifulSoup(text, "html.parser")
+                title = soup.title.string.strip() if soup.title else "No title"
+                desc = (soup.find("meta", {"name": "description"}) or {}).get("content", "")
+                h1 = soup.h1.get_text(strip=True) if soup.h1 else ""
+                words = len(soup.get_text().split())
+                links = len(soup.find_all("a"))
+                images = len(soup.find_all("img"))
+                snippet = soup.get_text()[:1500]
+                return (f"🌐 {title}\n"
+                        f"Desc: {desc[:150]}\nH1: {h1}\n"
+                        f"Words:{words} Links:{links} Images:{images}\n\n"
+                        f"Snippet:\n{snippet}")
     except Exception as e:
-        log.error(f"TTS error: {e}")
-        await update.message.reply_text("Couldn't generate audio; sent text instead.")
+        return f"⚠️ Crawl error: {e}"
 
-# ---------------- Commands ----------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hey Blaize 👋 Alex is online — learning and evolving 24/7.")
+async def analyze_url(url: str) -> str:
+    content = await fetch_url(url)
+    if content.startswith("⚠️"):
+        return content
+    summary = await ask_ai(f"Summarize and extract SEO notes:\n\n{content}")
+    return summary
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"✅ Alive. Uptime {get_uptime()}")
+# ---------- Telegram Commands ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hey, I'm Alex 🤖 Always on.")
 
-async def cmd_net(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _state_lock:
-        st = load_state()
-    ok = "✅" if st.get("net_ok") else "❌"
-    ms = st.get("last_net_ms")
-    ts = st.get("last_net_check")
-    await update.message.reply_text(f"{ok} Net: {ms if ms is not None else '-'} ms | last check: {ts or '-'}")
+async def uptime(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = int(time.time() - START_TIME)
+    h, m, s = u // 3600, (u % 3600) // 60, u % 60
+    await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
 
-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("What should we think about? 🙂  Example: `/ai best laptop under 1k`")
-        return
-    q = " ".join(context.args)
-    prefix = auto_web_enrich(q) if should_web_enrich(q) else None
-    reply = gpt_reply(q)
-    final = f"{prefix}\n\n{reply}" if prefix else reply
-    await update.message.reply_text(final)
-    u = update.message.from_user
-    log_conversation(u.username or "Unknown", u.id, q, final)
+async def ai_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = " ".join(ctx.args)
+    if not q:
+        return await update.message.reply_text("Usage: /ai your question")
+    ans = await ask_ai(q)
+    await update.message.reply_text(ans)
 
-async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _state_lock:
-        st = load_state()
-    persona = st.get("persona", DEFAULT_PERSONA)
-    facts = st.get("facts", [])
-    notes = st.get("notes", [])[-10:]
-    msg = (
-        f"🧠 Persona:\n{persona}\n\n"
-        f"📌 Facts ({len(facts)}):\n" + ("\n".join([f"- {f}" for f in facts[:12]]) or "—") + "\n\n"
-        f"🗒️ Recent Notes:\n" + ("\n".join([f"- {n}" for n in notes]) or "—")
+async def analyze_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /analyze <url>")
+    url = ctx.args[0]
+    await update.message.reply_text("🔍 Crawling...")
+    result = await analyze_url(url)
+    await update.message.reply_text(result)
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "🤖 *Alex Commands*\n\n"
+        "/start - Greet\n"
+        "/uptime - Show uptime\n"
+        "/ai <question> - Ask AI\n"
+        "/analyze <url> - Crawl & analyze a webpage\n"
+        "Type `search <query>` - Search via SERPAPI\n"
+        "Send a link - Auto analyze\n"
+        "Send text - AI response"
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(help_text, parse_mode="Markdown")
 
-async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Teach me something to remember, e.g. `/learn I prefer short bullet answers.`")
-        return
-    fact = " ".join(context.args).strip()
-    with _state_lock:
-        st = load_state()
-        st.setdefault("facts", []).insert(0, fact)
-        st["facts"] = st["facts"][:60]
-        save_state(st)
-    db_add_fact(fact)
-    await update.message.reply_text("Saved to long-term memory ✅")
-
-async def cmd_resetmemory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _state_lock:
-        st = load_state()
-        st["facts"], st["notes"] = [], []
-        st["persona"] = DEFAULT_PERSONA
-        save_state(st)
-    await update.message.reply_text("Memory and persona reset ✅")
-
-async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    topic = " ".join(context.args).strip() if context.args else "technology"
-    items = fetch_news(topic)
-    if not items:
-        await update.message.reply_text("News lookup needs `SERPAPI_KEY` or found nothing.")
-        return
-    lines = [f"- {it['title']} — {it['link']}" for it in items]
-    await update.message.reply_text("📰 Latest:\n" + "\n".join(lines))
-    with _state_lock:
-        st = load_state()
-        st["last_news"] = items
-        save_state(st)
-
-async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("🎨 Describe what you want me to imagine. Example:\n`/imagine a futuristic city skyline`")
-        return
-    prompt = " ".join(context.args).strip()
-    await update.message.reply_text(f"✨ Creating image: {prompt}")
-    try:
-        result = client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt,
-            size="1024x1024"
-        )
-        url = result.data[0].url
-        await update.message.reply_photo(photo=url, caption=f"🖼️ {prompt}")
-    except Exception as e:
-        log.error(f"Image generation error: {e}")
-        await update.message.reply_text("❌ Couldn't generate the image.")
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with _db_lock:
-        conv_count = _db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-        facts_count = _db.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-        notes_count = _db.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-    await update.message.reply_text(f"📊 Stats — conversations: {conv_count}, facts: {facts_count}, notes: {notes_count}")
-
-async def cmd_adminreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Danger: nukes everything except DB tables themselves
-    try:
-        if os.path.exists(LOG_FILE): os.remove(LOG_FILE)
-        if os.path.exists(STATE_FILE): os.remove(STATE_FILE)
-        with _db_lock, _db:
-            _db.execute("DELETE FROM conversations")
-            _db.execute("DELETE FROM facts")
-            _db.execute("DELETE FROM notes")
-            _db.execute("DELETE FROM kv")
-            _db.commit()
-        with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["timestamp_utc", "username", "user_id", "query", "reply"])
-        await update.message.reply_text("🧨 Admin reset completed.")
-    except Exception as e:
-        log.error(f"Admin reset error: {e}")
-        await update.message.reply_text("Reset failed.")
-
-# ---- New: /analyze command for URLs ----
-async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = " ".join(context.args) if context.args else ""
-    urls = extract_urls(args)
-    if not urls:
-        await update.message.reply_text("Usage: `/analyze https://example.com/page`", parse_mode="Markdown")
-        return
-    url = urls[0]
-    await update.message.reply_text("🔍 Fetching and analyzing…")
-    report = analyze_url(url)
-    await update.message.reply_text(report, disable_web_page_preview=False)
-
-# ---------------- Natural free chat / routing ----------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    text = update.message.text.strip()
-    u = update.message.from_user
-    username = u.username or "Unknown"
-
-    # quick pings
-    if text.lower() == "you there?":
-        await update.message.reply_text(f"Always here 👊 (uptime {get_uptime()})")
+# ---------- Auto message handling ----------
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if not text:
         return
 
-    # manual search
+    # --- Search ---
     if text.lower().startswith("search "):
-        q = text[7:].strip()
-        await update.message.reply_text(search_google(q))
-        return
-
-    # voice only on explicit trigger
-    if text.lower().startswith("alex say "):
-        phrase = text[9:].strip()
-        if not phrase:
-            await update.message.reply_text("What should I say?")
-            return
-        await update.message.reply_text(f"🎙️ Okay: {phrase}")
-        await tts_send(update, phrase)
-        return
-
-    # If a URL is present in free text, auto-analyze the first one
-    urls = extract_urls(text)
-    if urls:
-        await update.message.reply_text("🔍 Got your link — analyzing…")
-        report = analyze_url(urls[0])
-        await update.message.reply_text(report, disable_web_page_preview=False)
-        log_conversation(username, u.id, text, report)
-        return
-
-    # auto web enrichment when useful (no prompt required)
-    prefix = auto_web_enrich(text) if should_web_enrich(text) else None
-
-    # natural AI reply (with memory/persona)
-    reply = gpt_reply(text)
-    final = f"{prefix}\n\n{reply}" if prefix else reply
-    await update.message.reply_text(final)
-    log_conversation(username, u.id, text, final)
-
-# ---------------- Error handler ----------------
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Exception while handling update:", exc_info=context.error)
-    if isinstance(update, Update) and getattr(update, "message", None):
+        query = text[7:]
+        if not SERPAPI_KEY:
+            return await update.message.reply_text("No SERPAPI_KEY set.")
         try:
-            await update.message.reply_text("Something glitched, but I’m back.")
-        except Exception:
-            pass
+            r = requests.get("https://serpapi.com/search", params={"q": query, "hl": "en", "api_key": SERPAPI_KEY})
+            j = r.json()
+            snippet = j.get("organic_results", [{}])[0].get("snippet", "(no results)")
+            return await update.message.reply_text(f"🔎 {query}\n{snippet}")
+        except Exception as e:
+            return await update.message.reply_text(f"Error: {e}")
 
-# ---------------- Self-Learning Utilities ----------------
-def read_new_rows_since(idx_start: int) -> List[Dict[str, str]]:
-    rows = []
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            rdr = list(csv.DictReader(f))
-        for i, row in enumerate(rdr, start=1):
-            if i >= idx_start:
-                rows.append(row)
-    except Exception as e:
-        log.error(f"Read CSV error: {e}")
-    return rows
+    # --- URL analyze ---
+    if text.startswith("http://") or text.startswith("https://"):
+        await update.message.reply_text("🔍 Got your link — analyzing...")
+        result = await analyze_url(text)
+        return await update.message.reply_text(result)
 
-def summarize_and_update_persona(notes_text: str, current_persona: str) -> Dict[str, Any]:
-    try:
-        prompt = (
-            "You are maintaining a long-lived AI assistant called Alex.\n"
-            "Given the recent conversation snippets below, first produce 3-6 concise bullet 'Notes' "
-            "about user preferences, recurring topics, or helpful procedures (actionable, durable). "
-            "Then propose up to two subtle improvements to Alex's persona (voice/tone/skills) "
-            "that will make him more helpful for this user. Keep persona changes small and compatible.\n\n"
-            f"Current persona:\n{current_persona}\n\n"
-            f"Recent conversation snippets:\n{notes_text}\n"
-        )
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.4,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = (resp.choices[0].message.content or "").strip()
+    # --- Default: Ask AI ---
+    ans = await ask_ai(text)
+    await update.message.reply_text(ans)
 
-        notes, new_persona = [], current_persona
-        for line in text.splitlines():
-            s = line.strip(" •-").strip()
-            if not s or s.lower().startswith(("persona", "notes")):
-                continue
-            notes.append(s)
-
-        # Heuristic: if the model separated sections with blank lines, last chunk may be persona
-        if "\n\n" in text:
-            chunks = [c.strip() for c in text.split("\n\n") if c.strip()]
-            if len(chunks) >= 2:
-                new_persona = chunks[-1][:1200]
-
-        return {"notes_texts": notes[:6], "persona": new_persona or current_persona}
-    except Exception as e:
-        log.error(f"Self-learning summary error: {e}")
-        return {"notes_texts": [], "persona": current_persona}
-
-# ---------------- Background worker (every ~60s) ----------------
-def self_learning_worker(interval_seconds: int = 60):
+# ---------- Self-learning worker ----------
+def learning_worker():
     while True:
         try:
-            net_ping()
-
-            with _state_lock:
-                st = load_state()
-                start_idx = int(st.get("last_seen_row", 1))
-
-            rows = read_new_rows_since(start_idx)
-            if rows:
-                snippets = []
-                for r in rows[-40:]:
-                    snippets.append(f"User: {r['query']}\nAlex: {r['reply']}")
-                corpus = "\n\n".join(snippets)[-8000:]
-
-                with _state_lock:
-                    persona_before = st.get("persona", DEFAULT_PERSONA)
-                upd = summarize_and_update_persona(corpus, persona_before)
-
-                with _state_lock:
-                    st = load_state()
-                    new_notes = upd["notes_texts"]
-                    for n in new_notes:
-                        db_add_note(n)
-                    st["notes"] = (new_notes + st.get("notes", []))[:80]
-                    st["persona"] = upd["persona"][:1600]
-                    st["last_seen_row"] = start_idx + len(rows)
-                    st["last_update_iso"] = datetime.now(timezone.utc).isoformat()
-                    save_state(st)
-                log.info("🧠 Self-learning pass complete.")
-
-            if SERPAPI_KEY:
-                items = fetch_news("technology")
-                if items:
-                    with _state_lock:
-                        st = load_state()
-                        st["last_news"] = items
-                        save_state(st)
-
+            if memory["history"]:
+                snippet = " ".join(memory["history"][-5:])
+                persona_update = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "system", "content": "Update persona from last lines"},
+                              {"role": "user", "content": snippet}]
+                ).choices[0].message.content
+                memory["persona"]["notes"] = persona_update
+                save_memory()
         except Exception as e:
-            log.error(f"Self-learning loop error: {e}")
+            logging.error(f"Learning error {e}")
+        time.sleep(60)
 
-        time.sleep(max(10, int(interval_seconds)))
+# ---------- Healthcheck ----------
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
 
-# ---------------- Tiny HTTP health server (Railway) ----------------
-async def handle_health(request):
-    return web.Response(text="ok")
+def run_health():
+    HTTPServer(("0.0.0.0", PORT), H).serve_forever()
 
-async def run_health_server():
-    app = web.Application()
-    app.add_routes([web.get("/health", handle_health), web.get("/", handle_health)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"🌐 Health server running on :{port}")
-
-# ---------------- Bot runner ----------------
-def build_bot_app() -> Application:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("ping",   cmd_ping))
-    app.add_handler(CommandHandler("net",    cmd_net))
-    app.add_handler(CommandHandler("ai",     cmd_ai))
-    app.add_handler(CommandHandler("imagine", cmd_imagine))
-    app.add_handler(CommandHandler("memory", cmd_memory))
-    app.add_handler(CommandHandler("learn",  cmd_learn))
-    app.add_handler(CommandHandler("resetmemory", cmd_resetmemory))
-    app.add_handler(CommandHandler("news",   cmd_news))
-    app.add_handler(CommandHandler("stats",  cmd_stats))
-    app.add_handler(CommandHandler("adminreset",  cmd_adminreset))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))   # NEW
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-    return app
-
-# ✅ Async polling (PTB v20+ safe)
-async def run_telegram_polling():
-    app = build_bot_app()
-    log.info("🚀 Alex is running (Telegram polling)...")
-
-    await app.initialize()
-    await app.start()
-
-    # Ensure we're not in webhook mode before polling
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        log.warning(f"delete_webhook warning: {e}")
-
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
-    # Idle until SIGINT/SIGTERM
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
-
-    await stop_event.wait()
-
-    # graceful shutdown
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-
-# ---------------- Main (with background learning) ----------------
+# ---------- Main ----------
 def main():
-    # background learner (daemon thread)
-    t = threading.Thread(target=self_learning_worker, kwargs={"interval_seconds": 60}, daemon=True)
-    t.start()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("uptime", uptime))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("analyze", analyze_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    async def orchestrate():
-        # Start health server (non-blocking) then Telegram polling
-        await run_health_server()
-        await run_telegram_polling()
+    threading.Thread(target=learning_worker, daemon=True).start()
+    threading.Thread(target=run_health, daemon=True).start()
 
-    try:
-        asyncio.run(orchestrate())
-    except KeyboardInterrupt:
-        log.info("🛑 Received keyboard interrupt — exiting.")
-    except SystemExit:
-        log.info("🛑 System exit requested.")
-    except Exception as e:
-        log.error(f"Fatal error: {e}", exc_info=True)
+    logging.info("Bot running...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
