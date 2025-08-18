@@ -1,5 +1,5 @@
 # =========================
-# mega.py — Alex (Railway/GitHub ready, compact + multi-provider, detailed logging)
+# mega.py — Alex (Railway/GitHub ready, compact + fully-featured, w/ OpenAI key rotation or Ollama)
 # =========================
 # Features:
 # - Telegram bot (python-telegram-bot v20)
@@ -13,29 +13,45 @@
 # - Persona auto-learning worker (periodically distills notes)
 # - Health server (PORT for Railway), backup/export/config
 # - SerpAPI search (/search)
-# - NEW: Multi-provider LLM client with automatic fallback:
-#   Ollama → OpenRouter → Groq → Together → OpenAI (configurable via ENV)
+# - AI backend: OpenAI (safe multi-key rotation + backoff) or Ollama
+#
+# Env (required): TELEGRAM_TOKEN
+# Env (AI backend):
+#   BACKEND=openai|ollama   (default openai)
+#   # OpenAI:
+#   OPENAI_API_KEYS="key1,key2,..." or OPENAI_API_KEY="single"
+#   OPENAI_MODEL=gpt-4o-mini (default)
+#   # Ollama:
+#   OLLAMA_HOST=http://localhost:11434 (default)
+#   OLLAMA_MODEL=llama3.1:8b-instruct (default)
+# Other env:
+#   SERPAPI_KEY (optional for /search)
+#   PORT=8080 (default for health)
+#   HUMANE_TONE=1 (default 1)
 # =========================
 
-import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile
+import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile, random
 from pathlib import Path
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ---------- bootstrap: install/import (auto-installs missing deps) ----------
 def _ensure(import_name: str, pip_name: str | None = None):
-    try: return __import__(import_name)
+    try:
+        return __import__(import_name)
     except ModuleNotFoundError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name or import_name])
         return __import__(import_name)
 
 requests=_ensure("requests"); aiohttp=_ensure("aiohttp")
-_ensure("bs4","beautifulsoup4"); _ensure("python-telegram-bot","python-telegram-bot==20.*")
-telegram=_ensure("telegram"); _ensure("pandas"); _ensure("openpyxl"); _ensure("PIL","Pillow")
+_ensure("bs4","beautifulsoup4"); _ensure("pandas"); _ensure("openpyxl"); _ensure("PIL","Pillow")
+t_ext=_ensure("telegram.ext","python-telegram-bot==20.*"); telegram=_ensure("telegram")
 
-# Optional OCR (requires tesseract system binary to actually OCR)
-try: _ensure("pytesseract"); HAS_TESS=True
-except Exception: HAS_TESS=False
+# Optional OCR module (system must also have tesseract binary installed to actually OCR)
+try:
+    _ensure("pytesseract"); HAS_TESS=True
+except Exception:
+    HAS_TESS=False
 
 from PIL import Image, ExifTags
 from bs4 import BeautifulSoup
@@ -50,176 +66,119 @@ SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
 PORT=int(os.getenv("PORT","8080"))
 HUMANE_TONE=os.getenv("HUMANE_TONE","1")=="1"
 
-# Provider env (set any subset; order matters for fallback)
-# 1) OLLAMA
-OLLAMA_BASE=os.getenv("OLLAMA_BASE_URL","").rstrip("/")
-OLLAMA_MODEL=os.getenv("OLLAMA_MODEL","")
-# 2) OPENROUTER
-OPENROUTER_KEY=os.getenv("OPENROUTER_API_KEY","").strip()
-OPENROUTER_MODEL=os.getenv("OPENROUTER_MODEL","meta-llama/llama-3-70b-instruct")
-# 3) GROQ
-GROQ_KEY=os.getenv("GROQ_API_KEY","").strip()
-GROQ_MODEL=os.getenv("GROQ_MODEL","llama3-70b-8192")
-# 4) TOGETHER
-TOGETHER_KEY=os.getenv("TOGETHER_API_KEY","").strip()
-TOGETHER_MODEL=os.getenv("TOGETHER_MODEL","meta-llama/Meta-Llama-3-70B-Instruct-Turbo")
-# 5) OPENAI
-OPENAI_KEY=os.getenv("OPENAI_API_KEY","").strip()
-OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-4o-mini")
+BACKEND=os.getenv("BACKEND","openai").strip().lower()
+OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-4o-mini").strip()
+OPENAI_KEYS=[k.strip() for k in os.getenv("OPENAI_API_KEYS","").split(",") if k.strip()]
+if not OPENAI_KEYS and os.getenv("OPENAI_API_KEY","").strip():
+    OPENAI_KEYS=[os.getenv("OPENAI_API_KEY","").strip()]
+OLLAMA_HOST=os.getenv("OLLAMA_HOST","http://localhost:11434").strip().rstrip("/")
+OLLAMA_MODEL=os.getenv("OLLAMA_MODEL","llama3.1:8b-instruct").strip()
 
-if not TELEGRAM_TOKEN: logging.warning("TELEGRAM_TOKEN not set.")
-if not any([OLLAMA_BASE, OPENROUTER_KEY, GROQ_KEY, TOGETHER_KEY, OPENAI_KEY]):
-    logging.warning("No LLM provider keys/URL set. You can still run, but AI answers will be limited.")
+if not TELEGRAM_TOKEN: logging.warning("TELEGRAM_TOKEN not set (required).")
+logging.info("AI backend: %s", BACKEND)
+if BACKEND=="openai":
+    logging.info("OpenAI model: %s | keys: %d provided", OPENAI_MODEL, len(OPENAI_KEYS))
+elif BACKEND=="ollama":
+    logging.info("Ollama model: %s @ %s", OLLAMA_MODEL, OLLAMA_HOST)
 
 logging.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available (EXIF only)")
 
 START_TIME=time.time()
 SAVE_DIR=Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
 
-# ---------- Multi-provider AI client with automatic fallback ----------
-class AIClient:
+# ---------- AI backend (OpenAI with rotation/backoff OR Ollama) ----------
+class AIBackend:
     """
-    Tries providers in priority order. If a provider fails (timeout, rate limit, quota, network),
-    it logs and falls through to the next one. Designed to work with a single key as well.
-    Order (change by editing self.providers):
-      1) Ollama (if OLLAMA_BASE_URL set)
-      2) OpenRouter (if OPENROUTER_API_KEY set)
-      3) Groq (if GROQ_API_KEY set)
-      4) Together (if TOGETHER_API_KEY set)
-      5) OpenAI (if OPENAI_API_KEY set)
+    Unifies chat across OpenAI or Ollama.
+    - OpenAI: rotates your own API keys if provided; retries on 429/network with exponential backoff.
+      This improves reliability but does not bypass provider policies.
+    - Ollama: local/server model via REST.
     """
-    def __init__(self):
-        self.session = requests.Session()
-        self.timeout = 30
-        self.providers = []
-        if OLLAMA_BASE and OLLAMA_MODEL:
-            self.providers.append(("ollama", self._call_ollama))
-        if OPENROUTER_KEY:
-            self.providers.append(("openrouter", self._call_openrouter))
-        if GROQ_KEY:
-            self.providers.append(("groq", self._call_groq))
-        if TOGETHER_KEY:
-            self.providers.append(("together", self._call_together))
-        if OPENAI_KEY:
-            self.providers.append(("openai", self._call_openai))
+    def __init__(self, backend:str):
+        self.backend=backend
+        self._key_idx=0
+        self._session = requests.Session()
 
-    def chat(self, messages, max_tokens=800, sys_prompt=None):
-        """
-        Unified chat call. Will cycle providers until one succeeds.
-        Returns text or a short diagnostic if none are available.
-        """
-        payload = {"messages": messages, "max_tokens": max_tokens, "sys_prompt": sys_prompt or ""}
-        errors = []
-        for name, fn in self.providers:
+        if backend=="openai":
+            # Lazy import to avoid hard dependency if using Ollama
             try:
-                logging.info("AI provider attempt: %s", name)
-                out = fn(payload)
-                if out and isinstance(out, str):
-                    logging.info("AI provider success: %s", name)
-                    return out.strip()
-                errors.append(f"{name}: empty response")
+                from openai import OpenAI as _New
+                self._new_sdk_cls=_New
+            except Exception:
+                self._new_sdk_cls=None
+            try:
+                import openai as _old
+                self._old_sdk=_old
+            except Exception:
+                self._old_sdk=None
+
+    def _pick_key(self):
+        if not OPENAI_KEYS:
+            return None
+        # simple round-robin
+        key = OPENAI_KEYS[self._key_idx % len(OPENAI_KEYS)]
+        self._key_idx = (self._key_idx + 1) % max(1,len(OPENAI_KEYS))
+        return key
+
+    def chat(self, messages:list[dict], model:str=None, max_tokens:int=800, timeout:float=45.0)->str:
+        model = model or (OPENAI_MODEL if self.backend=="openai" else OLLAMA_MODEL)
+        if self.backend=="ollama":
+            # Non-streaming chat with Ollama REST /api/chat
+            try:
+                payload={"model":model,"messages":messages,"stream":False,"options":{}}
+                r=self._session.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
+                r.raise_for_status()
+                j=r.json()
+                # Ollama returns {"message":{"content":"..."}, "done":true, ...}
+                if "message" in j and "content" in j["message"]:
+                    return (j["message"]["content"] or "").strip()
+                # Some versions return accumulated "messages" or "response"
+                if "response" in j:
+                    return (j["response"] or "").strip()
+                return "⚠️ Ollama: unexpected response."
             except Exception as e:
-                msg = f"{name} error: {e}"
-                logging.warning(msg)
-                errors.append(msg)
-        if not self.providers:
-            return "⚠️ No AI providers configured. Add OLLAMA_BASE_URL or any *_API_KEY."
-        return "⚠️ All AI providers failed:\n" + "\n".join(errors[:4])
+                logging.exception("Ollama chat error")
+                return f"⚠️ Ollama error: {e}"
 
-    # ----- Provider adapters -----
-    def _call_ollama(self, p):
-        """
-        Ollama HTTP API: POST /api/chat
-        Requires OLLAMA_BASE_URL + OLLAMA_MODEL. Great when you run your own host.
-        """
-        url=f"{OLLAMA_BASE}/api/chat"
-        data={
-            "model": OLLAMA_MODEL,
-            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
-            "options": {"num_predict": p["max_tokens"]},
-            "stream": False
-        }
-        r=self.session.post(url, json=data, timeout=self.timeout)
-        r.raise_for_status()
-        j=r.json()
-        return (j.get("message",{}) or {}).get("content","")
+        # OpenAI path with rotation/backoff
+        if not OPENAI_KEYS:
+            return "⚠️ OPENAI_API_KEY(S) not set."
 
-    def _call_openrouter(self, p):
-        """
-        OpenRouter REST: POST https://openrouter.ai/api/v1/chat/completions
-        Single API key, many models. Good 'one-key' option from phone.
-        """
-        url="https://openrouter.ai/api/v1/chat/completions"
-        headers={"Authorization":f"Bearer {OPENROUTER_KEY}","Content-Type":"application/json"}
-        data={
-            "model": OPENROUTER_MODEL,
-            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
-            "max_tokens": p["max_tokens"]
-        }
-        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
-        r.raise_for_status()
-        j=r.json()
-        return j["choices"][0]["message"]["content"]
+        attempts = max(3, len(OPENAI_KEYS))  # try at least 3 times or once per key
+        base_sleep=1.2
+        for i in range(attempts):
+            key=self._pick_key()
+            if not key: return "⚠️ No OpenAI key available."
+            try:
+                # Try new SDK first if import worked
+                if self._new_sdk_cls:
+                    cli=self._new_sdk_cls(api_key=key)
+                    r=cli.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
+                    return r.choices[0].message.content.strip()
+                # Fallback to old SDK
+                elif self._old_sdk:
+                    self._old_sdk.api_key = key
+                    r=self._old_sdk.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens, request_timeout=timeout)
+                    return r["choices"][0]["message"]["content"].strip()
+                else:
+                    return "⚠️ OpenAI SDK not available."
+            except Exception as e:
+                # If it's a rate/quota/network, backoff and rotate
+                msg=str(e).lower()
+                retriable = any(t in msg for t in ["rate limit", "quota", "429", "timeout", "temporarily unavailable", "connection", "tls", "service unavailable"])
+                logging.warning("OpenAI call failed on attempt %d/%d with key idx %d: %s", i+1, attempts, self._key_idx-1, e)
+                if i<attempts-1 and retriable:
+                    sleep = base_sleep * (2 ** i) + random.random()*0.5
+                    time.sleep(sleep)
+                    continue
+                return f"⚠️ OpenAI error: {e}"
+        return "⚠️ OpenAI: all attempts failed."
 
-    def _call_groq(self, p):
-        """
-        Groq REST: POST https://api.groq.com/openai/v1/chat/completions
-        Very fast Llama-3. Often generous free limits; great fallback.
-        """
-        url="https://api.groq.com/openai/v1/chat/completions"
-        headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json"}
-        data={
-            "model": GROQ_MODEL,
-            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
-            "max_tokens": p["max_tokens"]
-        }
-        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
-        r.raise_for_status()
-        j=r.json()
-        return j["choices"][0]["message"]["content"]
-
-    def _call_together(self, p):
-        """
-        Together REST: POST https://api.together.xyz/v1/chat/completions
-        Big frontier models hosted; good capacity.
-        """
-        url="https://api.together.xyz/v1/chat/completions"
-        headers={"Authorization":f"Bearer {TOGETHER_KEY}","Content-Type":"application/json"}
-        data={
-            "model": TOGETHER_MODEL,
-            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
-            "max_tokens": p["max_tokens"]
-        }
-        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
-        r.raise_for_status()
-        j=r.json()
-        return j["choices"][0]["message"]["content"]
-
-    def _call_openai(self, p):
-        """
-        OpenAI (optional fallback). Uses REST for zero extra deps.
-        """
-        url="https://api.openai.com/v1/chat/completions"
-        headers={"Authorization":f"Bearer {OPENAI_KEY}","Content-Type":"application/json"}
-        data={
-            "model": OPENAI_MODEL,
-            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
-            "max_tokens": p["max_tokens"]
-        }
-        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
-        r.raise_for_status()
-        j=r.json()
-        return j["choices"][0]["message"]["content"]
-
-AI = AIClient()
+AI = AIBackend(BACKEND)
 
 async def ask_ai(prompt:str, context:str="")->str:
-    """
-    Unified AI ask. If no providers configured, returns a helpful notice.
-    """
-    messages = [{"role":"system","content": context or "You are Alex — concise, helpful, a little witty."},
-                {"role":"user","content": prompt}]
-    return AI.chat(messages, max_tokens=900)
+    sysmsg = context or "You are Alex — concise, helpful, a little witty."
+    return AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=800)
 
 # ---------- SQLite: RAW memory (append-only) + NOTES (summaries) ----------
 DB_PATH="alex_memory.db"; conn=sqlite3.connect(DB_PATH, check_same_thread=False); cur=conn.cursor()
@@ -241,7 +200,7 @@ def log_raw(ev_type:str, text:str, meta:dict|None=None)->int:
     ts=datetime.utcnow().isoformat(); m=json.dumps(meta or {}, ensure_ascii=False)
     cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m)); conn.commit()
     rid=cur.lastrowid; _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
-    logging.info("raw[%s] %s: %s", rid, ev_type, (text[:160]+"…") if len(text)>160 else text); return rid
+    logging.info("raw[%s] %s: %s", rid, ev_type, (text[:200]+"…") if len(text)>200 else text); return rid
 
 # ---------- Summarisation + topic merge ----------
 def _topic_key(text:str)->str:
@@ -255,7 +214,8 @@ def _merge_contents(old:str, new:str)->str:
              {"role":"user","content":f"EXISTING:\n{old}\n\nNEW:\n{new}"}],
             max_tokens=240
         )
-    except Exception: return (old+"\n"+new)[:1200]
+    except Exception:
+        return (old+"\n"+new)[:1200]
 
 def _humane_summarize(text:str, capture_tone:bool=True)->dict:
     sysmsg="Compress into human memory: 3–6 bullets or 2–4 short sentences; essentials only."
@@ -267,7 +227,8 @@ def _humane_summarize(text:str, capture_tone:bool=True)->dict:
         except Exception: data={"title":"","summary":out.strip(),"tags":"","sentiment":""}
         return {"title":(data.get("title") or "")[:120],"summary":(data.get("summary") or out).strip(),
                 "tags":(data.get("tags") or "").replace("\n"," ").strip(),"sentiment":(data.get("sentiment") or "").strip()}
-    except Exception: return {"title":"","summary":text[:900],"tags":"","sentiment":""}
+    except Exception:
+        return {"title":"","summary":text[:900],"tags":"","sentiment":""}
 
 def remember(source:str, text:str, raw_ref:str="")->int:
     digest=_humane_summarize(text, True); topic=_topic_key(digest["summary"] or text)
@@ -429,7 +390,8 @@ def _exif_dict(im:Image.Image)->dict:
         for k in ["DateTime","Make","Model","Software","LensModel","Orientation","ExifVersion","XResolution","YResolution"]:
             if k in label: keep[k]=label[k]
         return keep
-    except Exception: return {}
+    except Exception:
+        return {}
 
 def analyze_image(path:Path)->str:
     meta={"file":str(path)}
@@ -445,12 +407,14 @@ def analyze_image(path:Path)->str:
         remember("image", gist, raw_ref=str(path))
         return f"🖼️ Image saved. EXIF keys: {list(exif.keys()) if exif else 'none'}. OCR length: {len(ocr)} chars. (raw id {rid})"
     except Exception as e:
-        log_raw("image", f"Image load error {path.name}: {e}", {"file":str(path)}); logging.exception("Image analysis error")
-        return f"⚠️ Image analysis error: {e}"
+        log_raw("image", f"Image load error {path.name}: {e}", {"file": str(path)})
+        logging.exception("Image analysis error"); return f"⚠️ Image analysis error: {e}"
 
 # ---------- Trading log parsing ----------
-TRADE_PATTERNS=[re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
-                re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I)]
+TRADE_PATTERNS=[
+    re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
+    re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
+]
 def summarize_trade_line(line:str)->str|None:
     for pat in TRADE_PATTERNS:
         m=pat.search(line)
@@ -484,19 +448,8 @@ async def uptime_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
 
 async def config_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    flags={
-        "HUMANE_TONE":HUMANE_TONE,
-        "HAS_TESS":HAS_TESS,
-        "SERPAPI_KEY_set":bool(SERPAPI_KEY),
-        "DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),"PORT":PORT,
-        "Providers":{
-            "ollama":bool(OLLAMA_BASE and OLLAMA_MODEL),
-            "openrouter":bool(OPENROUTER_KEY),
-            "groq":bool(GROQ_KEY),
-            "together":bool(TOGETHER_KEY),
-            "openai":bool(OPENAI_KEY),
-        }
-    }
+    flags={"BACKEND":BACKEND,"OPENAI_MODEL":OPENAI_MODEL,"OLLAMA_MODEL":OLLAMA_MODEL,"HUMANE_TONE":HUMANE_TONE,
+           "HAS_TESS":HAS_TESS,"SERPAPI_KEY_set":bool(SERPAPI_KEY),"DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),"PORT":PORT}
     await update.message.reply_text("Config:\n"+json.dumps(flags, indent=2))
 
 async def backup_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -631,8 +584,7 @@ async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if   name.endswith(".xlsx"): out=analyze_excel(file_path)
     elif name.endswith(".csv"):  out=analyze_csv(file_path)
     elif name.endswith(".json"): out=analyze_json(file_path)
-    else:
-        remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I currently analyze Excel (.xlsx), CSV, and JSON."
+    else: remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I currently analyze Excel (.xlsx), CSV, and JSON."
     log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
 
 # --- photo uploads ---
@@ -710,26 +662,39 @@ def main():
     global GLOBAL_APP
     if not TELEGRAM_TOKEN:
         logging.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
-
+    if BACKEND=="openai" and not OPENAI_KEYS:
+        logging.warning("OpenAI backend selected but no OPENAI_API_KEY(S) provided.")
     app=Application.builder().token(TELEGRAM_TOKEN).build(); GLOBAL_APP=app
+
     # commands
-    app.add_handler(CommandHandler("start", start_cmd)); app.add_handler(CommandHandler("id", id_cmd))
-    app.add_handler(CommandHandler("uptime", uptime_cmd)); app.add_handler(CommandHandler("config", config_cmd))
-    app.add_handler(CommandHandler("backup", backup_cmd)); app.add_handler(CommandHandler("ai", ai_cmd))
-    app.add_handler(CommandHandler("ask", ask_cmd)); app.add_handler(CommandHandler("search", search_cmd))
-    app.add_handler(CommandHandler("analyze", analyze_cmd)); app.add_handler(CommandHandler("remember", remember_cmd))
-    app.add_handler(CommandHandler("mem", mem_cmd)); app.add_handler(CommandHandler("exportmem", exportmem_cmd))
-    app.add_handler(CommandHandler("raw", raw_cmd)); app.add_handler(CommandHandler("setlog", setlog_cmd))
-    app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd)); app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("uptime", uptime_cmd))
+    app.add_handler(CommandHandler("config", config_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("ask", ask_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("analyze", analyze_cmd))
+    app.add_handler(CommandHandler("remember", remember_cmd))
+    app.add_handler(CommandHandler("mem", mem_cmd))
+    app.add_handler(CommandHandler("exportmem", exportmem_cmd))
+    app.add_handler(CommandHandler("raw", raw_cmd))
+    app.add_handler(CommandHandler("setlog", setlog_cmd))
+    app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))
+    app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
     app.add_handler(CommandHandler("logs", logs_cmd))
+
     # messages
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
     # background threads
     threading.Thread(target=start_health, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
+
     logging.info("Alex mega bot starting…"); app.run_polling(close_loop=False)
 
 if __name__=="__main__": main()
