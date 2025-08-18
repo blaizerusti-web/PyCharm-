@@ -10,3 +10,5 @@ openai
 feedparser
 aiohttp
 pandas
+lxml
+python-dotenv
