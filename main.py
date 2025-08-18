@@ -1,157 +1,180 @@
 # =========================
-# mega_alex.py  —  Alex (All-in-One, Railway/Koyeb-ready)
+# mega.py  — Alex (all-in-one, evolving memory)
 # =========================
-# Features
-# - Telegram bot: /start /uptime /ai /search /analyze /id
-# - Paste a URL → auto-crawl + SEO summary
-# - File uploads: Excel (.xlsx) → stats + summary (pandas/openpyxl)
-# - “Infinite memory” via SQLite (convos, urls, files, notes)
-# - Recall & export: /memory /recall <query> /export_memory
-# - Self-learning persona notes
-# - Live log watcher: /setlog /subscribe_logs /unsubscribe_logs /logs
+# Features:
+# - Telegram bot: /start /uptime /ai /search /analyze /memory /persona /id
+# - Unified memory: SQLite (alex_memory.db)
+#   • conversations(user_text, alex_reply)
+#   • links(url, title, summary, full_text, metadata_json)
+#   • files(filename, rows, cols, preview, raw_json)
+#   • persona(notes)
+# - Self-learning: background worker builds evolution notes from recent data
+# - URL crawler + SEO summarize (stores to memory)
+# - File uploads: Excel quick stats (stores to memory)
 # - Health HTTP server (PORT env, default 8080)
-# - Safe auto-install of missing deps
+# - Live log watcher with /setlog /subscribe_logs /unsubscribe_logs /logs
+# - Safe auto-install of missing dependencies
 
-import os, sys, json, time, threading, logging, asyncio, subprocess, re, sqlite3, io, zipfile
+import os, sys, json, time, threading, logging, asyncio, subprocess, re, socket, sqlite3, textwrap
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import List, Dict, Any, Tuple
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ---------- bootstrap: install/import dependencies ----------
-def _ensure(pkg_import: str, pip_name: str | None = None):
+def _ensure(pkg_import: str, pip_name: str = None):
     try:
         return __import__(pkg_import)
     except ModuleNotFoundError:
         pip_name = pip_name or pkg_import
-        print(f"[BOOT] Installing {pip_name} …", flush=True)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name])
+        print(f"[BOOT] Installing {pip_name} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-input", "--quiet", pip_name])
         return __import__(pkg_import)
 
 requests = _ensure("requests")
 aiohttp  = _ensure("aiohttp")
 bs4      = _ensure("bs4", "beautifulsoup4")
 telegram = _ensure("telegram")
-_ensure("telegram.ext", "python-telegram-bot==20.*")
-_ensure("openpyxl")
+t_ext    = _ensure("telegram.ext", "python-telegram-bot==20.*")
+openai_m = _ensure("openai")
 try:
     pd = __import__("pandas")
 except ModuleNotFoundError:
     pd = _ensure("pandas")
+openpyxl = _ensure("openpyxl")
 
 from bs4 import BeautifulSoup
-from telegram import Update, InputFile
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# OpenAI (support new or legacy SDK)
-try:
-    from openai import OpenAI
-    _oa_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    def ai_chat(messages, model="gpt-4o-mini", max_tokens=700):
-        r = _oa_client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
-        return r.choices[0].message.content.strip()
-except Exception:
-    import openai as _openai_legacy
-    _openai_legacy.api_key = os.getenv("OPENAI_API_KEY")
-    def ai_chat(messages, model="gpt-4o-mini", max_tokens=700):
-        r = _openai_legacy.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens)
-        return r["choices"][0]["message"]["content"].strip()
+# OpenAI: support both new/old SDKs
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+def _make_ai_chat():
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        def ai_chat(messages, model="gpt-4o-mini", max_tokens=600):
+            resp = client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
+            return resp.choices[0].message.content.strip()
+        return ai_chat
+    except Exception:
+        import openai as _openai
+        _openai.api_key = OPENAI_API_KEY
+        def ai_chat(messages, model="gpt-4o-mini", max_tokens=600):
+            resp = _openai.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens)
+            return resp["choices"][0]["message"]["content"].strip()
+        return ai_chat
+
+ai_chat = _make_ai_chat()
 
 # ---------- config / logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 SERPAPI_KEY    = os.getenv("SERPAPI_KEY", "").strip()
 PORT           = int(os.getenv("PORT", "8080"))
 
-if not TELEGRAM_TOKEN:
-    logging.warning("TELEGRAM_TOKEN not set — the bot will exit at startup.")
-
 START_TIME = time.time()
 SAVE_DIR = Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
+DB_PATH = Path("alex_memory.db")
 
-# ---------- SQLite “infinite memory” ----------
-DB = Path("alex.db")
-
-def _db():
-    conn = sqlite3.connect(DB, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
+# ---------- SQLite unified memory ----------
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
-    conn = _db()
+def db_init():
+    conn = db_conn()
     cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT, role TEXT, content TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS urls (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT, url TEXT, title TEXT, summary TEXT, raw_stats TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT, filename TEXT, path TEXT, summary TEXT, meta TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS notes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT UNIQUE, value TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS subscribers (
-        chat_id TEXT PRIMARY KEY
-    );""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS config (
-        key TEXT PRIMARY KEY, value TEXT
-    );""")
-    conn.commit(); conn.close()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            user_text TEXT,
+            alex_reply TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT,
+            summary TEXT,
+            full_text TEXT,
+            metadata_json TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            rows INTEGER,
+            cols INTEGER,
+            preview TEXT,
+            raw_json TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS persona (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            notes TEXT,
+            updated_at TEXT
+        );
+    """)
+    cur.execute("""
+        INSERT OR IGNORE INTO persona (id, notes, updated_at)
+        VALUES (1, '', datetime('now'));
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS kv (
+            k TEXT PRIMARY KEY,
+            v TEXT
+        );
+    """)
+    conn.commit()
+    conn.close()
 
-def db_exec(sql: str, params: Tuple | List | None = None):
-    def _run():
-        conn = _db()
-        cur = conn.cursor()
-        cur.execute(sql, params or [])
-        conn.commit()
-        conn.close()
-    return asyncio.to_thread(_run)
+def db_execute(sql: str, params: Tuple = ()):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    conn.close()
 
-def db_query(sql: str, params: Tuple | List | None = None):
-    def _run():
-        conn = _db()
-        cur = conn.cursor()
-        cur.execute(sql, params or [])
-        rows = cur.fetchall()
-        conn.close()
-        return rows
-    return asyncio.to_thread(_run)
+def db_query(sql: str, params: Tuple = ()) -> List[sqlite3.Row]:
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
-async def mem_add_message(chat_id: int, role: str, content: str):
-    await db_exec("INSERT INTO messages(chat_id,role,content) VALUES (?,?,?)",
-                  (str(chat_id), role, content))
+db_init()
 
-async def mem_add_url(chat_id: int, url: str, title: str, summary: str, raw_stats: str):
-    await db_exec("INSERT INTO urls(chat_id,url,title,summary,raw_stats) VALUES (?,?,?,?,?)",
-                  (str(chat_id), url, title, summary, raw_stats))
+def persona_get() -> str:
+    r = db_query("SELECT notes FROM persona WHERE id=1 LIMIT 1")
+    return (r[0]["notes"] if r else "").strip()
 
-async def mem_add_file(chat_id: int, filename: str, path: str, summary: str, meta: str):
-    await db_exec("INSERT INTO files(chat_id,filename,path,summary,meta) VALUES (?,?,?,?,?)",
-                  (str(chat_id), filename, path, summary, meta))
-
-async def mem_set_note(key: str, value: str):
-    await db_exec("INSERT INTO notes(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                  (key, value))
+def persona_set(notes: str):
+    db_execute("UPDATE persona SET notes=?, updated_at=datetime('now') WHERE id=1", (notes,))
 
 # ---------- AI core ----------
 async def ask_ai(prompt: str, context: str = "") -> str:
-    if not OPENAI_API_KEY:
+    if ai_chat is None:
         return "⚠️ OPENAI_API_KEY not set."
     try:
+        sys_context = (
+            "You are Alex — concise, helpful, and slightly witty. "
+            "Leverage the persona notes if they help answer better.\n\n"
+            f"Persona:\n{persona_get()}"
+        )
         messages = [
-            {"role": "system", "content": context or "You are Alex — concise, helpful, proactive, and a little witty."},
-            {"role": "user",   "content": prompt}
+            {"role": "system", "content": context or sys_context},
+            {"role": "user", "content": prompt},
         ]
         return ai_chat(messages, model="gpt-4o-mini", max_tokens=700)
     except Exception as e:
@@ -159,67 +182,109 @@ async def ask_ai(prompt: str, context: str = "") -> str:
         return f"(AI error: {e})"
 
 # ---------- crawler ----------
-async def fetch_url(url: str) -> Dict[str, Any] | Dict[str, str]:
+async def fetch_url(url: str) -> Dict[str, Any]:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"}) as r:
-                if r.status != 200:
-                    return {"error": f"HTTP {r.status}"}
+                status = r.status
                 text = await r.text()
-        soup = BeautifulSoup(text, "html.parser")
-        title = soup.title.string.strip() if soup.title and soup.title.string else "No title"
-        desc_tag = soup.find("meta", {"name": "description"})
-        desc = (desc_tag.get("content", "") if desc_tag else "")
-        h1 = soup.h1.get_text(strip=True) if soup.h1 else ""
-        words = len(soup.get_text(" ").split())
-        links = len(soup.find_all("a"))
-        images = len(soup.find_all("img"))
-        snippet = soup.get_text(" ")[:2000]
-        return {
-            "title": title, "desc": desc, "h1": h1,
-            "words": words, "links": links, "images": images,
-            "snippet": snippet
-        }
+                if status != 200:
+                    return {"ok": False, "error": f"HTTP {status}"}
     except Exception as e:
-        return {"error": f"Crawl error: {e}"}
+        return {"ok": False, "error": f"Crawl error: {e}"}
 
-async def analyze_url(url: str) -> Tuple[str, str]:
+    soup = BeautifulSoup(text, "html.parser")
+    title = soup.title.string.strip() if soup.title and soup.title.string else "No title"
+    desc_tag = soup.find("meta", {"name": "description"})
+    desc = (desc_tag.get("content", "") if desc_tag else "")
+    h1 = soup.h1.get_text(strip=True) if soup.h1 else ""
+    words = len(soup.get_text(" ").split())
+    links = len(soup.find_all("a"))
+    images = len(soup.find_all("img"))
+    full_text = soup.get_text(" ")
+    # bound full_text length to keep DB sane
+    full_text = full_text[:200_000]
+
+    meta = {
+        "description": desc,
+        "h1": h1,
+        "words": words,
+        "link_count": links,
+        "image_count": images,
+        "ts": datetime.utcnow().isoformat()
+    }
+    return {
+        "ok": True,
+        "title": title,
+        "full_text": full_text,
+        "meta": meta
+    }
+
+async def analyze_url(url: str) -> str:
     data = await fetch_url(url)
-    if "error" in data: 
-        return data["error"], ""
-    raw_stats = f"Words:{data['words']} Links:{data['links']} Images:{data['images']}"
-    prompt = (
-        f"Summarize the page in 6 bullets, then list SEO opportunities, key entities, and actions.\n\n"
-        f"Title: {data['title']}\nDesc: {data['desc']}\nH1: {data['h1']}\n{raw_stats}\n\n"
-        f"Snippet:\n{data['snippet']}"
+    if not data.get("ok"):
+        return f"⚠️ {data.get('error','Unknown crawl error')}"
+    title = data["title"]
+    full_text = data["full_text"]
+    meta = data["meta"]
+
+    # Summarize via AI
+    summary_prompt = f"""Summarize this page in 8-12 bullet points.
+Include: topic, key claims, entities, SEO opportunities, and 3 suggested actions.
+
+TITLE: {title}
+META: {json.dumps(meta)[:1200]}
+CONTENT:
+{full_text[:6000]}
+"""
+    summary = await ask_ai(summary_prompt)
+
+    # Store into DB
+    db_execute(
+        "INSERT INTO links (ts, url, title, summary, full_text, metadata_json) VALUES (datetime('now'), ?, ?, ?, ?, ?)",
+        (url, title, summary, full_text, json.dumps(meta))
     )
-    summary = await ask_ai(prompt)
-    return summary, raw_stats
 
-# ---------- Excel analyzer ----------
-def _analyze_excel_sync(file_path: Path) -> Tuple[str, Dict[str, Any]]:
+    return f"🌐 {title}\n\n{summary}"
+
+# ---------- Excel analyzer (stored to DB) ----------
+def analyze_excel_to_db(path: Path) -> str:
     try:
-        df = pd.read_excel(file_path)  # requires openpyxl (bootstrapped)
-        head_cols = ", ".join([str(c) for c in list(df.columns)[:12]])
-        info = f"✅ Excel loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head_cols}"
+        df = pd.read_excel(path)
+        rows, cols = df.shape
+        head_cols = list(df.columns)[:12]
+        preview_rows = df.head(8).to_dict(orient="records")
         numeric_cols = df.select_dtypes(include="number").columns.tolist()
-        meta = {"rows": int(df.shape[0]), "cols": int(df.shape[1]), "columns": [str(c) for c in df.columns]}
+
+        profile = {}
         if numeric_cols:
-            stats = df[numeric_cols].describe().to_string()
-            info += f"\n\nNumeric summary:\n{stats[:1800]}"
-            meta["numeric_summary"] = stats[:5000]
-        else:
-            meta["numeric_summary"] = ""
-        return info, meta
+            profile["numeric_summary"] = df[numeric_cols].describe(include="all").to_dict()
+
+        raw = {
+            "columns": list(df.columns),
+            "dtypes": {c: str(t) for c, t in df.dtypes.items()},
+            **profile
+        }
+
+        # Store
+        db_execute(
+            "INSERT INTO files (ts, filename, rows, cols, preview, raw_json) VALUES (datetime('now'), ?, ?, ?, ?, ?)",
+            (path.name, rows, cols, json.dumps(preview_rows), json.dumps(raw))
+        )
+
+        summary_lines = [
+            f"✅ Excel loaded: {rows} rows × {cols} cols",
+            f"Columns: {', '.join(map(str, head_cols))}"
+        ]
+        if numeric_cols:
+            summary_lines.append(f"Numeric columns: {', '.join(numeric_cols[:12])}")
+        return "\n".join(summary_lines)
     except Exception as e:
-        return f"⚠️ Excel analysis error: {e}", {}
+        return f"⚠️ Excel analysis error: {e}"
 
-async def analyze_excel(file_path: Path) -> Tuple[str, Dict[str, Any]]:
-    return await asyncio.to_thread(_analyze_excel_sync, file_path)
-
-# ---------- trading log parsing (example/generic) ----------
+# ---------- Trading log parsing (generic) ----------
 TRADE_PATTERNS = [
-    re.compile(r"\b(BUY|SELL)\b.*?([A-Z]{1,10}).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
+    re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
     re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
 ]
 
@@ -227,12 +292,16 @@ def summarize_trade_line(line: str) -> str | None:
     for pat in TRADE_PATTERNS:
         m = pat.search(line)
         if m:
-            g = m.groups()
+            g = [x for x in m.groups()]
             if len(g) == 4:
                 side, sym, qty, price = g[0], g[1], g[2], g[3]
-                try: qty = int(qty)
-                except: pass
-                return f"🟢 {side.upper()} {sym} qty {qty} @ {price}"
+            else:
+                continue
+            try:
+                qty_i = int(qty)
+            except:
+                qty_i = qty
+            return f"🟢 {side.upper()} {sym} qty {qty_i} @ {price}"
     return None
 
 # ---------- Telegram handlers ----------
@@ -240,12 +309,8 @@ GLOBAL_APP: Application | None = None
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hey, I'm Alex 🤖\n"
-        "Commands:\n"
-        "/uptime /ai /search /analyze /id\n"
-        "/setlog /subscribe_logs /unsubscribe_logs /logs\n"
-        "/memory /recall <q> /export_memory\n"
-        "Send a URL to analyze, or upload an Excel file."
+        "Hey, I'm Alex 🤖 — evolving memory enabled.\n"
+        "Commands: /uptime /ai /search /analyze /memory /persona /setlog /subscribe_logs /unsubscribe_logs /logs /id"
     )
 
 async def id_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -262,8 +327,8 @@ async def ai_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /ai <your question>")
     ans = await ask_ai(q)
     await update.message.reply_text(ans)
-    await mem_add_message(update.effective_chat.id, "user", "/ai " + q)
-    await mem_add_message(update.effective_chat.id, "assistant", ans)
+    # store to conversations
+    db_execute("INSERT INTO conversations (ts, user_text, alex_reply) VALUES (datetime('now'), ?, ?)", (q, ans))
 
 async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -272,8 +337,7 @@ async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("⚠️ SERPAPI_KEY not set.")
     query = " ".join(ctx.args)
     try:
-        r = requests.get("https://serpapi.com/search",
-                         params={"q": query, "hl": "en", "api_key": SERPAPI_KEY}, timeout=25)
+        r = requests.get("https://serpapi.com/search", params={"q": query, "hl": "en", "api_key": SERPAPI_KEY}, timeout=25)
         j = r.json()
         snip = j.get("organic_results", [{}])[0].get("snippet", "(no results)")
         await update.message.reply_text(f"🔎 {query}\n{snip}")
@@ -285,188 +349,294 @@ async def analyze_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /analyze <url>")
     url = ctx.args[0]
     await update.message.reply_text("🔍 Crawling and summarizing…")
-    summary, raw_stats = await analyze_url(url)
-    await update.message.reply_text(summary[:4000])
-    await mem_add_url(update.effective_chat.id, url, "auto", summary, raw_stats)
+    res = await analyze_url(url)
+    await update.message.reply_text(res)
+
+async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Search unified memory and summarize matches."""
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /memory <query>")
+    q = " ".join(ctx.args).strip()
+    like = f"%{q}%"
+
+    convs = db_query("""
+        SELECT ts, user_text, alex_reply
+        FROM conversations
+        WHERE (user_text LIKE ? OR alex_reply LIKE ?)
+        ORDER BY id DESC LIMIT 20
+    """, (like, like))
+
+    links = db_query("""
+        SELECT ts, url, title, summary
+        FROM links
+        WHERE (url LIKE ? OR title LIKE ? OR summary LIKE ? OR full_text LIKE ?)
+        ORDER BY id DESC LIMIT 20
+    """, (like, like, like, like))
+
+    files = db_query("""
+        SELECT ts, filename, rows, cols
+        FROM files
+        WHERE (filename LIKE ? OR preview LIKE ? OR raw_json LIKE ?)
+        ORDER BY id DESC LIMIT 20
+    """, (like, like, like))
+
+    # Build a compact summary
+    lines = []
+    if convs:
+        lines.append(f"🗣️ Conversations: {len(convs)} hits")
+        for r in convs[:5]:
+            ut = (r['user_text'] or "")[:120].replace("\n"," ")
+            ar = (r['alex_reply'] or "")[:120].replace("\n"," ")
+            lines.append(f"• [{r['ts']}] U: {ut} | A: {ar}")
+    if links:
+        lines.append(f"\n🔗 Links: {len(links)} hits")
+        for r in links[:5]:
+            t = (r['title'] or "(no title)")[:100]
+            lines.append(f"• [{r['ts']}] {t} — {r['url']}")
+    if files:
+        lines.append(f"\n📂 Files: {len(files)} hits")
+        for r in files[:5]:
+            lines.append(f"• [{r['ts']}] {r['filename']} — {r['rows']}×{r['cols']}")
+
+    if not lines:
+        await update.message.reply_text("No matches in memory.")
+        return
+
+    # Optional: ask AI to synthesize a brief "what we know" from matches
+    synthesis = ""
+    try:
+        if ai_chat is not None:
+            prompt = "Summarize the key recurring themes and actionable insights from these memory hits:\n\n" + "\n".join(lines)
+            synthesis = "\n\n🧠 Memory synthesis:\n" + ai_chat(
+                [{"role":"system","content":"Be concise. 5-8 bullets."},
+                 {"role":"user","content":prompt}],
+                max_tokens=220
+            )
+    except Exception:
+        pass
+
+    out = "\n".join(lines)
+    # Telegram message limit: split if needed
+    chunk = out[:3500]
+    await update.message.reply_text("```\n" + chunk + "\n```", parse_mode="Markdown")
+    if synthesis:
+        await update.message.reply_text(synthesis)
+
+async def persona_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    notes = persona_get().strip() or "(empty)"
+    await update.message.reply_text(f"🧬 Persona notes:\n\n{notes}")
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    chat_id = update.effective_chat.id
-
-    if text.lower() == "analyse alex_profile":
-        replies = ["Let's get back to it.","Alright, I'm here — let's dive in.","Back in the zone.","Picking up where we left off.","Ready to roll."]
-        msg = replies[int(time.time()) % len(replies)]
-        await update.message.reply_text(msg)
-        await mem_add_message(chat_id, "system", "wake")
+    if not text:
         return
 
-    if text.startswith("http://") or text.startswith("https://"):
-        await update.message.reply_text("🔍 Got your link — analyzing…")
-        summary, raw_stats = await analyze_url(text)
-        await update.message.reply_text(summary[:4000])
-        await mem_add_url(chat_id, text, "auto", summary, raw_stats)
-    else:
-        ans = await ask_ai(text)
-        await update.message.reply_text(ans)
-        await mem_add_message(chat_id, "user", text)
-        await mem_add_message(chat_id, "assistant", ans)
+    # Quick wake-up phrase (kept for compatibility)
+    if text.lower() == "analyse alex_profile":
+        replies = [
+            "Let's get back to it.", "Alright, I'm here — let's dive in.",
+            "Back in the zone.", "Let's pick up where we left off.", "Okay, ready to roll."
+        ]
+        msg = replies[int(time.time()) % len(replies)]
+        await update.message.reply_text(msg)
+        # store
+        db_execute("INSERT INTO conversations (ts, user_text, alex_reply) VALUES (datetime('now'), ?, ?)", (text, msg))
+        return
+
+    # Auto-URL detection -> analyze + store
+    if text.startswith(("http://", "https://")):
+        await update.message.reply_text("🔍 Got your link — analyzing & saving to memory…")
+        res = await analyze_url(text)
+        await update.message.reply_text(res)
+        # also log the interaction
+        db_execute("INSERT INTO conversations (ts, user_text, alex_reply) VALUES (datetime('now'), ?, ?)", (text, res))
+        return
+
+    # Default AI Q&A + store to conversations
+    ans = await ask_ai(text)
+    await update.message.reply_text(ans)
+    db_execute("INSERT INTO conversations (ts, user_text, alex_reply) VALUES (datetime('now'), ?, ?)", (text, ans))
 
 # --- file uploads (Excel) ---
+SAVE_DIR = Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
+
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
-    if not doc: return
+    if not doc:
+        return
     file_path = SAVE_DIR / doc.file_name
     tg_file = await ctx.bot.get_file(doc.file_id)
     await tg_file.download_to_drive(file_path)
-    await update.message.reply_text(f"📂 Saved `{doc.file_name}` — analyzing…", parse_mode="Markdown")
+    await update.message.reply_text(f"📂 Saved `{doc.file_name}` — analyzing & storing…", parse_mode="Markdown")
 
     if doc.file_name.lower().endswith(".xlsx"):
-        out, meta = await analyze_excel(file_path)
-        await update.message.reply_text(out[:4000])
-        await mem_add_file(update.effective_chat.id, doc.file_name, str(file_path), out, json.dumps(meta))
+        out = analyze_excel_to_db(file_path)
+        await update.message.reply_text(out)
+        # log to conversations for traceability
+        db_execute("INSERT INTO conversations (ts, user_text, alex_reply) VALUES (datetime('now'), ?, ?)",
+                   (f"[uploaded file] {doc.file_name}", out))
     else:
         msg = "I currently analyze Excel (.xlsx). The file is saved."
         await update.message.reply_text(msg)
-        await mem_add_file(update.effective_chat.id, doc.file_name, str(file_path), msg, "{}")
+        db_execute("INSERT INTO conversations (ts, user_text, alex_reply) VALUES (datetime('now'), ?, ?)",
+                   (f"[uploaded file] {doc.file_name}", msg))
 
-# --- memory/recall/export ---
-async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    stats_msgs = await db_query("SELECT COUNT(*) FROM messages WHERE chat_id=?", (str(update.effective_chat.id),))
-    stats_urls = await db_query("SELECT COUNT(*) FROM urls WHERE chat_id=?", (str(update.effective_chat.id),))
-    stats_files = await db_query("SELECT COUNT(*) FROM files WHERE chat_id=?", (str(update.effective_chat.id),))
-    persona = await db_query("SELECT value FROM notes WHERE key='persona_notes'")
-    pm = persona[0][0] if persona else "(none yet)"
-    await update.message.reply_text(
-        f"🧠 Memory stats\n"
-        f"- Messages: {stats_msgs[0][0]}\n"
-        f"- URLs: {stats_urls[0][0]}\n"
-        f"- Files: {stats_files[0][0]}\n\n"
-        f"Persona notes:\n{pm[:1500]}"
-    )
-
-async def recall_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = " ".join(ctx.args) if ctx.args else ""
-    if not q:
-        return await update.message.reply_text("Usage: /recall <query>")
-    # naive LIKE search across memory
-    cid = str(update.effective_chat.id)
-    rows1 = await db_query("SELECT 'message', content, ts FROM messages WHERE chat_id=? AND content LIKE ? ORDER BY ts DESC LIMIT 5", (cid, f"%{q}%"))
-    rows2 = await db_query("SELECT 'url', url || ' — ' || substr(summary,1,120), ts FROM urls WHERE chat_id=? AND (url LIKE ? OR summary LIKE ?) ORDER BY ts DESC LIMIT 5", (cid, f"%{q}%", f"%{q}%"))
-    rows3 = await db_query("SELECT 'file', filename || ' — ' || substr(summary,1,120), ts FROM files WHERE chat_id=? AND (filename LIKE ? OR summary LIKE ?) ORDER BY ts DESC LIMIT 5", (cid, f"%{q}%", f"%{q}%"))
-    lines = []
-    for tag, txt, ts in rows1 + rows2 + rows3:
-        lines.append(f"[{tag}] {ts}  {txt}")
-    if not lines:
-        return await update.message.reply_text("No matches.")
-    await update.message.reply_text("🔎 Recall results:\n" + "\n".join(lines)[:3800])
-
-async def export_memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = str(update.effective_chat.id)
-    messages = await db_query("SELECT role, content, ts FROM messages WHERE chat_id=? ORDER BY ts", (cid,))
-    urls = await db_query("SELECT url, title, summary, raw_stats, ts FROM urls WHERE chat_id=? ORDER BY ts", (cid,))
-    files = await db_query("SELECT filename, path, summary, meta, ts FROM files WHERE chat_id=? ORDER BY ts", (cid,))
-    data = {"messages": messages, "urls": urls, "files": files}
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("memory.json", json.dumps(data, indent=2))
-    buf.seek(0)
-    await update.message.reply_document(InputFile(buf, filename="alex_memory.zip"), caption="📦 Your memory export")
-
-# --- log watcher commands + thread ---
+# --- log watcher commands ---
 async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         return await update.message.reply_text("Usage: /setlog /path/to/your.log")
     path = " ".join(ctx.args)
-    await db_exec("INSERT INTO config(key,value) VALUES('log_path',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (path,))
-    await update.message.reply_text(f"✅ Log path set: `{path}`", parse_mode="Markdown")
+    db_execute("INSERT OR REPLACE INTO kv (k, v) VALUES ('log_path', ?)", (path,))
+    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
 
 async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await db_exec("INSERT OR IGNORE INTO subscribers(chat_id) VALUES (?)", (str(update.effective_chat.id),))
+    chat_id = str(update.effective_chat.id)
+    # Store subscribers as CSV in kv['subscribers']
+    rows = db_query("SELECT v FROM kv WHERE k='subscribers'")
+    cur = set((rows[0]["v"].split(",")) if rows and rows[0]["v"] else [])
+    cur.add(chat_id)
+    db_execute("INSERT OR REPLACE INTO kv (k, v) VALUES ('subscribers', ?)", (",".join(sorted(cur)),))
     await update.message.reply_text("🔔 Subscribed to live log updates.")
 
 async def unsubscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await db_exec("DELETE FROM subscribers WHERE chat_id=?", (str(update.effective_chat.id),))
+    chat_id = str(update.effective_chat.id)
+    rows = db_query("SELECT v FROM kv WHERE k='subscribers'")
+    cur = set((rows[0]["v"].split(",")) if rows and rows[0]["v"] else [])
+    if chat_id in cur:
+        cur.remove(chat_id)
+        db_execute("INSERT OR REPLACE INTO kv (k, v) VALUES ('subscribers', ?)", (",".join(sorted(cur)),))
     await update.message.reply_text("🔕 Unsubscribed from log updates.")
 
 async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = 40
     if ctx.args:
-        try: n = max(1, min(400, int(ctx.args[0])))
-        except: pass
-    cfg = (await db_query("SELECT value FROM config WHERE key='log_path'")) or []
-    if not cfg: return await update.message.reply_text("⚠️ No log path set. Use /setlog <path>.")
-    path = cfg[0][0]
-    p = Path(path)
-    if not p.exists(): return await update.message.reply_text("⚠️ Log file not found.")
+        try:
+            n = max(1, min(400, int(ctx.args[0])))
+        except:
+            pass
+    rows = db_query("SELECT v FROM kv WHERE k='log_path'")
+    path = rows[0]["v"] if rows else ""
+    if not path or not Path(path).exists():
+        return await update.message.reply_text("⚠️ No log path set or file does not exist. Use /setlog <path>.")
     try:
-        lines = p.read_text(errors="ignore").splitlines()[-n:]
+        lines = Path(path).read_text(errors="ignore").splitlines()[-n:]
         await update.message.reply_text("```\n" + "\n".join(lines)[-3500:] + "\n```", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"Read error: {e}")
 
-def _post_to_subscribers(app: Application, text: str):
+# ---------- log watcher thread ----------
+GLOBAL_APP: Application | None = None
+
+def _post_to_subscribers(text: str):
+    rows = db_query("SELECT v FROM kv WHERE k='subscribers'")
+    sub_str = rows[0]["v"] if rows else ""
+    if not GLOBAL_APP or not sub_str:
+        return
+    subs = [s for s in sub_str.split(",") if s.strip()]
+    if not subs:
+        return
+    loop = GLOBAL_APP.bot._application.loop  # PTB v20
     async def _send():
-        rows = await db_query("SELECT chat_id FROM subscribers")
-        for (cid,) in rows:
+        for cid in subs:
             try:
-                await app.bot.send_message(chat_id=int(cid), text=text)
+                await GLOBAL_APP.bot.send_message(chat_id=int(cid), text=text)
             except Exception:
                 pass
-    asyncio.run_coroutine_threadsafe(_send(), app.bot._application.loop)
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), loop)
+    except Exception:
+        pass
 
-def watch_logs(app: Application):
+def watch_logs():
     last_size = 0
     last_raw_push = 0
     while True:
         try:
-            cfg = sqlite3.connect(DB).cursor().execute("SELECT value FROM config WHERE key='log_path'").fetchone()
-            if not cfg:
+            rows = db_query("SELECT v FROM kv WHERE k='log_path'")
+            path = rows[0]["v"] if rows else ""
+            if not path or not Path(path).exists():
                 time.sleep(2); continue
-            path = cfg[0]
             p = Path(path)
-            if not p.exists():
-                time.sleep(2); continue
             sz = p.stat().st_size
-            if sz < last_size: last_size = 0
+            if sz < last_size:
+                last_size = 0  # rotation
             if sz > last_size:
                 with p.open("r", errors="ignore") as f:
-                    if last_size: f.seek(last_size)
+                    if last_size:
+                        f.seek(last_size)
                     new = f.read()
                     last_size = sz
                 for line in new.splitlines():
                     s = summarize_trade_line(line)
-                    if s: _post_to_subscribers(app, s)
+                    if s:
+                        _post_to_subscribers(s)
                     now = time.time()
                     if now - last_raw_push > 15:
                         last_raw_push = now
-                        _post_to_subscribers(app, "📜 " + line[:900])
+                        _post_to_subscribers("📜 " + line[:900])
         except Exception as e:
             logging.error(f"log watcher error: {e}")
         time.sleep(1)
 
-# ---------- self-learning persona worker ----------
+# ---------- self-learning background ----------
 def learning_worker():
+    """
+    Periodically distill recent conversations + link summaries into persona notes.
+    """
     while True:
         try:
-            conn = _db(); cur = conn.cursor()
-            cur.execute("SELECT content FROM messages WHERE role='user' ORDER BY id DESC LIMIT 20")
-            recent = " ".join([r[0] for r in cur.fetchall()][::-1])
-            conn.close()
-            if recent:
-                note = ai_chat(
-                    [
-                        {"role":"system","content":"From these recent user lines, write 1–2 short bullet persona notes (preferences, tone, recurring goals)."},
-                        {"role":"user","content":recent}
-                    ],
-                    model="gpt-4o-mini", max_tokens=160
+            # Pull last items
+            conv = db_query("SELECT user_text, alex_reply FROM conversations ORDER BY id DESC LIMIT 30")
+            lnk  = db_query("SELECT title, summary FROM links ORDER BY id DESC LIMIT 12")
+            # Build a compact corpus
+            chunks = []
+            if conv:
+                chunks.append("Recent Conversations:\n" + "\n".join(
+                    [f"U:{(c['user_text'] or '')[:180]} | A:{(c['alex_reply'] or '')[:180]}" for c in conv]
+                ))
+            if lnk:
+                chunks.append("\nRecent Link Summaries:\n" + "\n".join(
+                    [f"{(r['title'] or '')[:120]} — {(r['summary'] or '')[:200]}" for r in lnk]
+                ))
+            corpus = "\n".join(chunks)
+            if corpus.strip() and ai_chat is not None:
+                prompt = (
+                    "From the following recent data, write 5–10 crisp 'persona evolution notes' "
+                    "that will help Alex answer better in the future. Focus on preferences, recurring tasks, "
+                    "entities, and any rules of thumb learned. Keep it compact.\n\n" + corpus[:9000]
                 )
-                sqlite3.connect(DB).cursor().execute(
-                    "INSERT INTO notes(key,value) VALUES('persona_notes',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (note,)
-                ).connection.commit()
+                notes = ai_chat(
+                    [{"role":"system","content":"Return only the bullet list, no preamble."},
+                     {"role":"user","content":prompt}],
+                    max_tokens=250
+                )
+                # Merge with existing persona notes (keep unique-ish lines)
+                existing = persona_get()
+                merged = _merge_persona(existing, notes)
+                persona_set(merged)
         except Exception as e:
             logging.error(f"learning error: {e}")
         time.sleep(60)
+
+def _merge_persona(existing: str, new: str) -> str:
+    def norm_lines(s: str) -> List[str]:
+        out = []
+        for line in s.splitlines():
+            t = line.strip(" -*•\t")
+            if t:
+                out.append(t)
+        return out
+    ex = norm_lines(existing)
+    nw = norm_lines(new)
+    # dedupe, keep recent first
+    seen = set()
+    merged = []
+    for line in nw + ex:
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            merged.append("• " + line)
+    return "\n".join(merged[:80])
 
 # ---------- health server ----------
 class Health(BaseHTTPRequestHandler):
@@ -477,9 +647,9 @@ class Health(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
 def start_health():
-    httpd = HTTPServer(("0.0.0.0", PORT), Health)
+    server = HTTPServer(("0.0.0.0", PORT), Health)
     logging.info(f"Health server on 0.0.0.0:{PORT}")
-    httpd.serve_forever()
+    server.serve_forever()
 
 # ---------- main ----------
 def main():
@@ -487,9 +657,9 @@ def main():
         logging.error("TELEGRAM_TOKEN missing — exiting.")
         sys.exit(1)
 
-    init_db()
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    global GLOBAL_APP
+    GLOBAL_APP = app
 
     # commands
     app.add_handler(CommandHandler("start", start_cmd))
@@ -499,23 +669,22 @@ def main():
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))
     app.add_handler(CommandHandler("memory", memory_cmd))
-    app.add_handler(CommandHandler("recall", recall_cmd))
-    app.add_handler(CommandHandler("export_memory", export_memory_cmd))
+    app.add_handler(CommandHandler("persona", persona_cmd))
     app.add_handler(CommandHandler("setlog", setlog_cmd))
     app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
     app.add_handler(CommandHandler("logs", logs_cmd))
 
-    # messages
+    # messages & files
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # background services
+    # background threads
     threading.Thread(target=start_health, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
-    threading.Thread(target=watch_logs, args=(app,), daemon=True).start()
+    threading.Thread(target=watch_logs, daemon=True).start()
 
-    logging.info("Alex mega bot starting…")
+    logging.info("Alex (mega) starting…")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
