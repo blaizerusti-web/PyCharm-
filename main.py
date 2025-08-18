@@ -1,5 +1,5 @@
 # =========================
-# mega.py — Alex (Railway/GitHub ready, compact but fully featured)
+# mega.py — Alex (Railway/GitHub ready, compact + multi-provider, detailed logging)
 # =========================
 # Features:
 # - Telegram bot (python-telegram-bot v20)
@@ -13,6 +13,8 @@
 # - Persona auto-learning worker (periodically distills notes)
 # - Health server (PORT for Railway), backup/export/config
 # - SerpAPI search (/search)
+# - NEW: Multi-provider LLM client with automatic fallback:
+#   Ollama → OpenRouter → Groq → Together → OpenAI (configurable via ENV)
 # =========================
 
 import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile
@@ -28,10 +30,10 @@ def _ensure(import_name: str, pip_name: str | None = None):
         return __import__(import_name)
 
 requests=_ensure("requests"); aiohttp=_ensure("aiohttp")
-_ensure("bs4","beautifulsoup4"); t_ext=_ensure("telegram.ext","python-telegram-bot==20.*"); telegram=_ensure("telegram")
-_ensure("openai"); _ensure("pandas"); _ensure("openpyxl"); _ensure("PIL","Pillow")
+_ensure("bs4","beautifulsoup4"); _ensure("python-telegram-bot","python-telegram-bot==20.*")
+telegram=_ensure("telegram"); _ensure("pandas"); _ensure("openpyxl"); _ensure("PIL","Pillow")
 
-# Optional OCR module (system must also have tesseract binary installed to actually OCR)
+# Optional OCR (requires tesseract system binary to actually OCR)
 try: _ensure("pytesseract"); HAS_TESS=True
 except Exception: HAS_TESS=False
 
@@ -44,40 +46,180 @@ import pandas as pd
 # ---------- config / logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN","").strip()
-OPENAI_API_KEY=os.getenv("OPENAI_API_KEY","").strip()
 SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
 PORT=int(os.getenv("PORT","8080"))
 HUMANE_TONE=os.getenv("HUMANE_TONE","1")=="1"
+
+# Provider env (set any subset; order matters for fallback)
+# 1) OLLAMA
+OLLAMA_BASE=os.getenv("OLLAMA_BASE_URL","").rstrip("/")
+OLLAMA_MODEL=os.getenv("OLLAMA_MODEL","")
+# 2) OPENROUTER
+OPENROUTER_KEY=os.getenv("OPENROUTER_API_KEY","").strip()
+OPENROUTER_MODEL=os.getenv("OPENROUTER_MODEL","meta-llama/llama-3-70b-instruct")
+# 3) GROQ
+GROQ_KEY=os.getenv("GROQ_API_KEY","").strip()
+GROQ_MODEL=os.getenv("GROQ_MODEL","llama3-70b-8192")
+# 4) TOGETHER
+TOGETHER_KEY=os.getenv("TOGETHER_API_KEY","").strip()
+TOGETHER_MODEL=os.getenv("TOGETHER_MODEL","meta-llama/Meta-Llama-3-70B-Instruct-Turbo")
+# 5) OPENAI
+OPENAI_KEY=os.getenv("OPENAI_API_KEY","").strip()
 OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-4o-mini")
 
 if not TELEGRAM_TOKEN: logging.warning("TELEGRAM_TOKEN not set.")
-if not OPENAI_API_KEY: logging.warning("OPENAI_API_KEY not set.")
+if not any([OLLAMA_BASE, OPENROUTER_KEY, GROQ_KEY, TOGETHER_KEY, OPENAI_KEY]):
+    logging.warning("No LLM provider keys/URL set. You can still run, but AI answers will be limited.")
+
 logging.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available (EXIF only)")
 
 START_TIME=time.time()
 SAVE_DIR=Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
 
-# ---------- OpenAI helper (works with new + old SDKs) ----------
-def _make_ai():
-    try:
-        from openai import OpenAI
-        cli=OpenAI(api_key=OPENAI_API_KEY)
-        def chat(messages, model=OPENAI_MODEL, max_tokens=800):
-            r=cli.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
-            return r.choices[0].message.content.strip()
-        return chat
-    except Exception:
-        import openai as _openai
-        _openai.api_key=OPENAI_API_KEY
-        def chat(messages, model=OPENAI_MODEL, max_tokens=800):
-            r=_openai.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens)
-            return r["choices"][0]["message"]["content"].strip()
-        return chat
-AI_CHAT=_make_ai()
+# ---------- Multi-provider AI client with automatic fallback ----------
+class AIClient:
+    """
+    Tries providers in priority order. If a provider fails (timeout, rate limit, quota, network),
+    it logs and falls through to the next one. Designed to work with a single key as well.
+    Order (change by editing self.providers):
+      1) Ollama (if OLLAMA_BASE_URL set)
+      2) OpenRouter (if OPENROUTER_API_KEY set)
+      3) Groq (if GROQ_API_KEY set)
+      4) Together (if TOGETHER_API_KEY set)
+      5) OpenAI (if OPENAI_API_KEY set)
+    """
+    def __init__(self):
+        self.session = requests.Session()
+        self.timeout = 30
+        self.providers = []
+        if OLLAMA_BASE and OLLAMA_MODEL:
+            self.providers.append(("ollama", self._call_ollama))
+        if OPENROUTER_KEY:
+            self.providers.append(("openrouter", self._call_openrouter))
+        if GROQ_KEY:
+            self.providers.append(("groq", self._call_groq))
+        if TOGETHER_KEY:
+            self.providers.append(("together", self._call_together))
+        if OPENAI_KEY:
+            self.providers.append(("openai", self._call_openai))
+
+    def chat(self, messages, max_tokens=800, sys_prompt=None):
+        """
+        Unified chat call. Will cycle providers until one succeeds.
+        Returns text or a short diagnostic if none are available.
+        """
+        payload = {"messages": messages, "max_tokens": max_tokens, "sys_prompt": sys_prompt or ""}
+        errors = []
+        for name, fn in self.providers:
+            try:
+                logging.info("AI provider attempt: %s", name)
+                out = fn(payload)
+                if out and isinstance(out, str):
+                    logging.info("AI provider success: %s", name)
+                    return out.strip()
+                errors.append(f"{name}: empty response")
+            except Exception as e:
+                msg = f"{name} error: {e}"
+                logging.warning(msg)
+                errors.append(msg)
+        if not self.providers:
+            return "⚠️ No AI providers configured. Add OLLAMA_BASE_URL or any *_API_KEY."
+        return "⚠️ All AI providers failed:\n" + "\n".join(errors[:4])
+
+    # ----- Provider adapters -----
+    def _call_ollama(self, p):
+        """
+        Ollama HTTP API: POST /api/chat
+        Requires OLLAMA_BASE_URL + OLLAMA_MODEL. Great when you run your own host.
+        """
+        url=f"{OLLAMA_BASE}/api/chat"
+        data={
+            "model": OLLAMA_MODEL,
+            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
+            "options": {"num_predict": p["max_tokens"]},
+            "stream": False
+        }
+        r=self.session.post(url, json=data, timeout=self.timeout)
+        r.raise_for_status()
+        j=r.json()
+        return (j.get("message",{}) or {}).get("content","")
+
+    def _call_openrouter(self, p):
+        """
+        OpenRouter REST: POST https://openrouter.ai/api/v1/chat/completions
+        Single API key, many models. Good 'one-key' option from phone.
+        """
+        url="https://openrouter.ai/api/v1/chat/completions"
+        headers={"Authorization":f"Bearer {OPENROUTER_KEY}","Content-Type":"application/json"}
+        data={
+            "model": OPENROUTER_MODEL,
+            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
+            "max_tokens": p["max_tokens"]
+        }
+        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
+        r.raise_for_status()
+        j=r.json()
+        return j["choices"][0]["message"]["content"]
+
+    def _call_groq(self, p):
+        """
+        Groq REST: POST https://api.groq.com/openai/v1/chat/completions
+        Very fast Llama-3. Often generous free limits; great fallback.
+        """
+        url="https://api.groq.com/openai/v1/chat/completions"
+        headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json"}
+        data={
+            "model": GROQ_MODEL,
+            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
+            "max_tokens": p["max_tokens"]
+        }
+        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
+        r.raise_for_status()
+        j=r.json()
+        return j["choices"][0]["message"]["content"]
+
+    def _call_together(self, p):
+        """
+        Together REST: POST https://api.together.xyz/v1/chat/completions
+        Big frontier models hosted; good capacity.
+        """
+        url="https://api.together.xyz/v1/chat/completions"
+        headers={"Authorization":f"Bearer {TOGETHER_KEY}","Content-Type":"application/json"}
+        data={
+            "model": TOGETHER_MODEL,
+            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
+            "max_tokens": p["max_tokens"]
+        }
+        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
+        r.raise_for_status()
+        j=r.json()
+        return j["choices"][0]["message"]["content"]
+
+    def _call_openai(self, p):
+        """
+        OpenAI (optional fallback). Uses REST for zero extra deps.
+        """
+        url="https://api.openai.com/v1/chat/completions"
+        headers={"Authorization":f"Bearer {OPENAI_KEY}","Content-Type":"application/json"}
+        data={
+            "model": OPENAI_MODEL,
+            "messages": [{"role":m["role"],"content":m["content"]} for m in p["messages"]],
+            "max_tokens": p["max_tokens"]
+        }
+        r=self.session.post(url, headers=headers, json=data, timeout=self.timeout)
+        r.raise_for_status()
+        j=r.json()
+        return j["choices"][0]["message"]["content"]
+
+AI = AIClient()
 
 async def ask_ai(prompt:str, context:str="")->str:
-    if not OPENAI_API_KEY: return "⚠️ OPENAI_API_KEY not set."
-    return AI_CHAT([{"role":"system","content":context or "You are Alex — concise, helpful, a little witty."},{"role":"user","content":prompt}])
+    """
+    Unified AI ask. If no providers configured, returns a helpful notice.
+    """
+    messages = [{"role":"system","content": context or "You are Alex — concise, helpful, a little witty."},
+                {"role":"user","content": prompt}]
+    return AI.chat(messages, max_tokens=900)
 
 # ---------- SQLite: RAW memory (append-only) + NOTES (summaries) ----------
 DB_PATH="alex_memory.db"; conn=sqlite3.connect(DB_PATH, check_same_thread=False); cur=conn.cursor()
@@ -99,7 +241,7 @@ def log_raw(ev_type:str, text:str, meta:dict|None=None)->int:
     ts=datetime.utcnow().isoformat(); m=json.dumps(meta or {}, ensure_ascii=False)
     cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m)); conn.commit()
     rid=cur.lastrowid; _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
-    logging.info("raw[%s] %s: %s", rid, ev_type, (text[:120]+"…") if len(text)>120 else text); return rid
+    logging.info("raw[%s] %s: %s", rid, ev_type, (text[:160]+"…") if len(text)>160 else text); return rid
 
 # ---------- Summarisation + topic merge ----------
 def _topic_key(text:str)->str:
@@ -108,9 +250,11 @@ def _topic_key(text:str)->str:
 
 def _merge_contents(old:str, new:str)->str:
     try:
-        return AI_CHAT([
-            {"role":"system","content":"Merge NEW into EXISTING. ≤120 words, bullet style OK. Preserve key facts/numbers."},
-            {"role":"user","content":f"EXISTING:\n{old}\n\nNEW:\n{new}"}], max_tokens=240)
+        return AI.chat(
+            [{"role":"system","content":"Merge NEW into EXISTING. ≤120 words, bullet style OK. Preserve key facts/numbers."},
+             {"role":"user","content":f"EXISTING:\n{old}\n\nNEW:\n{new}"}],
+            max_tokens=240
+        )
     except Exception: return (old+"\n"+new)[:1200]
 
 def _humane_summarize(text:str, capture_tone:bool=True)->dict:
@@ -118,7 +262,7 @@ def _humane_summarize(text:str, capture_tone:bool=True)->dict:
     if capture_tone and HUMANE_TONE: sysmsg+=" Detect tone (positive/neutral/negative + short descriptor)."
     prompt=f"Digest this into humane memory.\n\nTEXT:\n{text}\n\nReturn JSON: title, summary, tags (3-6), sentiment."
     try:
-        out=AI_CHAT([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=360)
+        out=AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=360)
         try: data=json.loads(out)
         except Exception: data={"title":"","summary":out.strip(),"tags":"","sentiment":""}
         return {"title":(data.get("title") or "")[:120],"summary":(data.get("summary") or out).strip(),
@@ -195,11 +339,11 @@ def search_memory(query:str, k_raw:int=12, k_notes:int=12)->dict:
 # ---------- RAG-style answer ----------
 def build_context_blurb(found:dict, max_chars:int=3800)->str:
     parts=[]
-    for n in found.get("notes",[]):  # prioritise notes (already summarised)
+    for n in found.get("notes",[]):
         blk=f"[NOTE #{n['id']} | {n['ts']} | {n['source']} | {n['title']}] {n['content']}"
         if n["tags"]: blk+=f" (tags: {n['tags']})"
         parts.append(blk)
-    for r in found.get("raw",[]):   # add raw snippets (exact facts)
+    for r in found.get("raw",[]):
         txt=r["text"]; txt=txt[:600]+"…" if len(txt)>600 else txt
         parts.append(f"[RAW #{r['id']} | {r['ts']} | {r['type']}] {txt}")
     return "\n\n".join(parts)[:max_chars]
@@ -281,7 +425,7 @@ def analyze_json(path:Path)->str:
 def _exif_dict(im:Image.Image)->dict:
     try:
         exif=im._getexif() or {}; label={ExifTags.TAGS.get(k,k):v for k,v in exif.items()}
-        keep={}; 
+        keep={}
         for k in ["DateTime","Make","Model","Software","LensModel","Orientation","ExifVersion","XResolution","YResolution"]:
             if k in label: keep[k]=label[k]
         return keep
@@ -340,8 +484,19 @@ async def uptime_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
 
 async def config_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    flags={"MODEL":OPENAI_MODEL,"HUMANE_TONE":HUMANE_TONE,"HAS_TESS":HAS_TESS,"SERPAPI_KEY_set":bool(SERPAPI_KEY),
-           "DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),"PORT":PORT}
+    flags={
+        "HUMANE_TONE":HUMANE_TONE,
+        "HAS_TESS":HAS_TESS,
+        "SERPAPI_KEY_set":bool(SERPAPI_KEY),
+        "DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),"PORT":PORT,
+        "Providers":{
+            "ollama":bool(OLLAMA_BASE and OLLAMA_MODEL),
+            "openrouter":bool(OPENROUTER_KEY),
+            "groq":bool(GROQ_KEY),
+            "together":bool(TOGETHER_KEY),
+            "openai":bool(OPENAI_KEY),
+        }
+    }
     await update.message.reply_text("Config:\n"+json.dumps(flags, indent=2))
 
 async def backup_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -476,7 +631,8 @@ async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if   name.endswith(".xlsx"): out=analyze_excel(file_path)
     elif name.endswith(".csv"):  out=analyze_csv(file_path)
     elif name.endswith(".json"): out=analyze_json(file_path)
-    else: remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I currently analyze Excel (.xlsx), CSV, and JSON."
+    else:
+        remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I currently analyze Excel (.xlsx), CSV, and JSON."
     log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
 
 # --- photo uploads ---
@@ -526,8 +682,11 @@ def learning_worker():
         try:
             cur.execute("SELECT content FROM notes ORDER BY id DESC LIMIT 24"); rec=[r[0] for r in cur.fetchall()]
             if rec:
-                persona=AI_CHAT([{"role":"system","content":"Create concise persona guidance from these snippets. 4–6 bullets."},
-                                 {"role":"user","content":"\n\n".join(rec)}], max_tokens=220)
+                persona=AI.chat(
+                    [{"role":"system","content":"Create concise persona guidance from these snippets. 4–6 bullets."},
+                     {"role":"user","content":"\n\n".join(rec)}],
+                    max_tokens=220
+                )
                 tk="__persona__"; cur.execute("SELECT id FROM notes WHERE topic_key=? ORDER BY id DESC LIMIT 1",(tk,)); row=cur.fetchone()
                 if row:
                     cur.execute("UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=? WHERE id=?",
@@ -549,8 +708,8 @@ def start_health(): HTTPServer(("0.0.0.0", PORT), Health).serve_forever()
 # ---------- main ----------
 def main():
     global GLOBAL_APP
-    if not TELEGRAM_TOKEN: logging.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
-    if not OPENAI_API_KEY: logging.error("OPENAI_API_KEY missing — exiting."); sys.exit(1)
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
 
     app=Application.builder().token(TELEGRAM_TOKEN).build(); GLOBAL_APP=app
     # commands
