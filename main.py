@@ -10,8 +10,14 @@ from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    filters, ContextTypes
 )
+
+# ✅ Safe SpeechRecognition import (won’t crash if missing)
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+    print("⚠️ SpeechRecognition not installed. Jarvis voice disabled.")
 
 # Optional: for TTS/STT + wake word Jarvis mode
 import speech_recognition as sr
@@ -735,3 +741,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ---------- Jarvis Voice ----------
+def listen_to_voice():
+    if sr is None:
+        return "Voice unavailable"
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("🎙️ Listening...")
+        audio = recognizer.listen(source)
+    try:
+        return recognizer.recognize_google(audio)
+    except Exception as e:
+        return f"Error: {e}"
