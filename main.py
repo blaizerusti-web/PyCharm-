@@ -888,8 +888,17 @@ class Health(BaseHTTPRequestHandler):
             body={"answer":ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
-        def start_health():
-    HTTPServer(("0.0.0.0", PORT), Health).serve_forever()
+        class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+if __name__ == "__main__":
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Health check server running on port {PORT}")
+    server.serve_forever()
 
 # ---------- Backend / Jarvis / Guardrails control commands ----------
 async def backend_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
