@@ -1,761 +1,816 @@
-# ================================
-# mega.py — Super Alex (Jarvis persona; OpenAI key-rotation or Ollama;
-# Telegram bot; OCR; optional voice IO; health server; watchdog; logging;
-# humane/unrestricted modes; persistence; growth hooks)
-# ================================
+# =========================
+# mega.py — Alex (OpenAI key-rotation or Ollama; Telegram; Memory; RAG; Shortcuts webhook; Jarvis)
+# =========================
 
-# ----------- stdlib -----------
-import os, sys, json, re, time, threading, logging, hashlib, sqlite3, base64, uuid, random
+import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile, random, uuid, base64
 from pathlib import Path
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import urlparse
+from typing import Optional, Dict, Any, List
 
-# -------- runtime memory (in-proc key/value) --------
-MEM_RUNTIME: Dict[str, Any] = {}  # used for round-robin indexes, caches, toggles
-
-def mget(key: str, default=None):
-    return MEM_RUNTIME.get(key, default)
-
-def mset(key: str, value: Any):
-    MEM_RUNTIME[key] = value
-    return value
-
-# ----------- soft/optional imports -----------
-import importlib
-
-def _soft_import(name: str):
+# ---------- bootstrap: install/import ----------
+def _ensure(import_name: str, pip_name: str | None = None):
     try:
-        return importlib.import_module(name)
-    except Exception:
-        return None
+        return __import__(import_name)
+    except ModuleNotFoundError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name or import_name])
+        return __import__(import_name)
 
-# Optional packages (don’t crash if missing)
-PIL = _soft_import("PIL")
-Image = getattr(PIL, "Image", None) if PIL else None
-pytesseract = _soft_import("pytesseract")
-pydub = _soft_import("pydub")     # for simple TTS playback (optional)
-sr = _soft_import("speech_recognition")  # optional voice input
-requests = _soft_import("requests") or __import__("urllib.request")  # fallback to stdlib if needed
+requests=_ensure("requests"); aiohttp=_ensure("aiohttp")
+_ensure("bs4","beautifulsoup4"); _ensure("pandas"); _ensure("openpyxl"); _ensure("PIL","Pillow")
+t_ext=_ensure("telegram.ext","python-telegram-bot==20.*"); telegram=_ensure("telegram")
 
-# Warn (but never crash) on optional deps
-if sr is None:
-    print("⚠️  SpeechRecognition not available — Jarvis voice input disabled.")
-if pytesseract is None or Image is None:
-    print("⚠️  OCR (pytesseract/Pillow) not available — /ocr disabled.")
-try:
-    # pydub warns about ffmpeg; that's fine
-    if pydub:
-        from pydub import AudioSegment, playback  # type: ignore
-except Exception:
-    pydub = None
+try: _ensure("pytesseract"); HAS_TESS=True
+except Exception: HAS_TESS=False
 
-# ----------- config helpers -----------
-def _env_bool(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+from PIL import Image, ExifTags
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import pandas as pd
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
+# ---------- config / logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger=logging.getLogger("mega")
 
-def _split_csv(val: Optional[str]) -> List[str]:
-    if not val:
-        return []
-    return [x.strip() for x in val.split(",") if x.strip()]
+TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN","").strip()
+OWNER_ID=os.getenv("OWNER_ID","").strip()   # your Telegram numeric user id
+PORT=int(os.getenv("PORT","8080"))
+SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
+HUMANE_TONE=os.getenv("HUMANE_TONE","1")=="1"
 
-ROOT = Path(os.getenv("APP_ROOT", "."))
+# AI backend
+BACKEND=os.getenv("BACKEND","openai").strip().lower()
+OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-4o-mini").strip()
+OPENAI_KEYS=[k.strip() for k in os.getenv("OPENAI_API_KEYS","").split(",") if k.strip()]
+if not OPENAI_KEYS and os.getenv("OPENAI_API_KEY","").strip():
+    OPENAI_KEYS=[os.getenv("OPENAI_API_KEY","").strip()]
 
-CFG: Dict[str, Any] = {
-    # Backends
-    "BACKEND": os.getenv("BACKEND", "openai"),  # "openai" | "ollama"
-    "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-    "OPENAI_API_KEYS": _split_csv(os.getenv("OPENAI_API_KEYS") or os.getenv("OPENAI_API_KEY")),
-    "OLLAMA_URL": os.getenv("OLLAMA_URL", "http://localhost:11434"),
-    "OLLAMA_MODEL": os.getenv("OLLAMA_MODEL", "llama3.1:8b-instruct"),
+OLLAMA_HOST=os.getenv("OLLAMA_HOST","http://localhost:11434").strip().rstrip("/")
+OLLAMA_MODEL=os.getenv("OLLAMA_MODEL","llama3.1:8b-instruct").strip()
 
-    # Telegram
-    "TELEGRAM_TOKEN": os.getenv("TELEGRAM_TOKEN", ""),
-    "ADMIN_IDS": [int(x) for x in _split_csv(os.getenv("ADMIN_IDS"))] if os.getenv("ADMIN_IDS") else [],
+# iOS Shortcuts webhook secret (required for /shortcut)
+SHORTCUT_SECRET=os.getenv("SHORTCUT_SECRET","").strip()
 
-    # Modes & safety toggles
-    "JARVIS_MODE": _env_bool("JARVIS_MODE", False),         # persona voice (witty assistant)
-    "HUMANE_TONE": _env_bool("HUMANE_TONE", True),          # gentle tone & helpfulness
-    "UNRESTRICTED_HINT": _env_bool("UNRESTRICTED_HINT", False),  # loosens style (still safe)
+# Optional STT/TTS flags (OpenAI only)
+USE_OPENAI_STT=os.getenv("USE_OPENAI_STT","0")=="1"
+USE_OPENAI_TTS=os.getenv("USE_OPENAI_TTS","0")=="1"
+OPENAI_TTS_VOICE=os.getenv("OPENAI_TTS_VOICE","alloy")
 
-    # Features
-    "ENABLE_OCR": _env_bool("ENABLE_OCR", True),
-    "ENABLE_SPEECH": _env_bool("ENABLE_SPEECH", False),     # only works if sr installed
-    "ENABLE_TTS": _env_bool("ENABLE_TTS", False),           # requires pydub+ffmpeg or OS TTS
-    "ENABLE_WEB": _env_bool("ENABLE_WEB", False),           # placeholder hook
-    "PERSIST_SQLITE": _env_bool("PERSIST_SQLITE", True),
+if not TELEGRAM_TOKEN: logger.warning("TELEGRAM_TOKEN not set (required).")
+logger.info("Backend: %s | OpenAI model=%s (keys=%d) | Ollama=%s @ %s",
+             BACKEND, OPENAI_MODEL, len(OPENAI_KEYS), OLLAMA_MODEL, OLLAMA_HOST)
+logger.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available")
 
-    # Infra
-    "PORT": _env_int("PORT", 8080),
-    "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
-    "KEEPALIVE_SECS": _env_int("KEEPALIVE_SECS", 45),
-    "HEALTH_SECRET": os.getenv("HEALTH_SECRET", hashlib.sha256(os.getenv("TELEGRAM_TOKEN","").encode()).hexdigest()[:10]),
-}
+START_TIME=time.time()
+SAVE_DIR=Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
 
-# ----------- logging -----------
-LOGS_DIR = ROOT / "logs"
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    level=getattr(logging, CFG["LOG_LEVEL"].upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOGS_DIR / "app.log", encoding="utf-8"),
-    ],
-)
-log = logging.getLogger("alex")
+# Heartbeat file
+HEARTBEAT=Path("heartbeat.txt")
 
-# ----------- SQLite persistence (growth hooks) -----------
-DB = ROOT / "alex.sqlite3"
-
-def db_init():
-    if not CFG["PERSIST_SQLITE"]:
-        return
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS messages(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT,
-        role TEXT,
-        text TEXT,
-        meta TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    )""")
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS events(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT,
-        detail TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    )""")
-    conn.commit()
-    conn.close()
-
-def db_log_message(user_id: str, role: str, text: str, meta: Optional[Dict[str, Any]] = None):
-    if not CFG["PERSIST_SQLITE"]:
-        return
-    try:
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        cur.execute("INSERT INTO messages(user_id, role, text, meta) VALUES (?,?,?,?)",
-                    (user_id, role, text, json.dumps(meta or {})))
-        conn.commit()
-    except Exception as e:
-        log.warning(f"db_log_message failed: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-def db_log_event(kind: str, detail: str):
-    if not CFG["PERSIST_SQLITE"]:
-        return
-    try:
-        conn = sqlite3.connect(DB)
-        cur = conn.cursor()
-        cur.execute("INSERT INTO events(kind, detail) VALUES (?,?)", (kind, detail))
-        conn.commit()
-    except Exception as e:
-        log.warning(f"db_log_event failed: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-db_init()
-
-# ----------- health server & keepalive -----------
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        try:
-            qs = parse_qs(urlparse(self.path).query)
-            secret = qs.get("s", [""])[0]
-            status = {
-                "ok": True,
-                "ts": datetime.utcnow().isoformat() + "Z",
-                "backend": CFG["BACKEND"],
-                "openai_model": CFG["OPENAI_MODEL"],
-                "ollama_model": CFG["OLLAMA_MODEL"],
-                "jarvis": CFG["JARVIS_MODE"],
-                "humane": CFG["HUMANE_TONE"],
-                "unrestricted_hint": CFG["UNRESTRICTED_HINT"],
-                "sr": bool(sr),
-                "ocr": bool(pytesseract and Image),
-            }
-            if secret != CFG["HEALTH_SECRET"]:
-                self.send_response(403); self.end_headers(); self.wfile.write(b"forbidden")
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(json.dumps(status).encode("utf-8"))
-        except Exception as e:
+# ---------- AI backend (OpenAI rotation/backoff OR Ollama) ----------
+class AIBackend:
+    def __init__(self, backend:str):
+        self.backend=backend
+        self._key_idx=0
+        self._session = requests.Session()
+        if backend=="openai":
             try:
-                self.send_response(500); self.end_headers(); self.wfile.write(str(e).encode())
+                from openai import OpenAI as _New
+                self._new_sdk_cls=_New
             except Exception:
-                pass
-
-def _start_health_server():
-    port = CFG["PORT"]
-    def _serve():
-        try:
-            httpd = HTTPServer(("0.0.0.0", port), _Health)
-            log.info(f"Health server on :{port} (secret ?s={CFG['HEALTH_SECRET']})")
-            httpd.serve_forever()
-        except Exception as e:
-            log.error(f"Health server error: {e}")
-    th = threading.Thread(target=_serve, daemon=True); th.start()
-
-def _keepalive():
-    # lightweight heartbeat (updates an in-memory timestamp and logs)
-    mset("last_tick", time.time())
-    db_log_event("tick", datetime.utcnow().isoformat() + "Z")
-    threading.Timer(CFG["KEEPALIVE_SECS"], _keepalive).start()
-
-# ----------- prompts & personas -----------
-BASE_SYSTEM = """You are Alex — a helpful, fast, developer-friendly assistant living inside a Telegram bot.
-Be clear, concise, and practical. If code is requested, return runnable snippets and explain briefly.
-Default to a friendly, humane style. Never expose secrets or tokens. Stay within platform limits.
-"""
-
-JARVIS_SPICE = """Adopt a confident “Jarvis” vibe: witty, succinct, solution-oriented.
-Use bullet points when helpful, and provide next steps. Keep it classy, not snarky.
-"""
-
-UNRESTRICTED_SPICE = """Relax stylistic guardrails slightly. Be more direct and exploratory, but still respectful and safe.
-Avoid illegal, dangerous, or disallowed content. Decline such requests firmly and propose safe alternatives.
-"""
-
-def build_system_prompt() -> str:
-    parts = [BASE_SYSTEM]
-    if CFG["HUMANE_TONE"]:
-        parts.append("Keep a warm, encouraging tone when appropriate.\n")
-    if CFG["JARVIS_MODE"]:
-        parts.append(JARVIS_SPICE)
-    if CFG["UNRESTRICTED_HINT"]:
-        parts.append(UNRESTRICTED_SPICE)
-    return "\n".join(parts).strip()
-
-# ----------- key rotation (OpenAI) -----------
-def _next_openai_key() -> Optional[str]:
-    keys = CFG["OPENAI_API_KEYS"]
-    if not keys:
-        return None
-    idx = mget("openai_rr", -1) + 1
-    if idx >= len(keys):
-        idx = 0
-    mset("openai_rr", idx)
-    return keys[idx]
-
-# ----------- providers -----------
-def _http_post(url: str, headers: Dict[str,str], payload: Dict[str,Any]) -> Tuple[int, Dict[str,Any]]:
-    """Simple POST wrapper using requests if available; fallback to urllib."""
-    try:
-        if hasattr(requests, "post"):
-            rsp = requests.post(url, headers=headers, json=payload, timeout=60)  # type: ignore
-            return rsp.status_code, (rsp.json() if rsp.content else {})
-        else:
-            import urllib.request
-            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=60) as f:   # nosec
-                data = f.read()
-                return 200, (json.loads(data.decode("utf-8")) if data else {})
-    except Exception as e:
-        return 0, {"error": str(e)}
-
-def llm_chat(messages: List[Dict[str,str]]) -> str:
-    """
-    Provider-agnostic chat. messages: [{"role":"system/user/assistant","content": "..."}]
-    Returns assistant text (best effort).
-    """
-    backend = CFG["BACKEND"].lower()
-
-    if backend == "ollama":
-        url = f"{CFG['OLLAMA_URL'].rstrip('/')}/api/chat"
-        payload = {"model": CFG["OLLAMA_MODEL"], "messages": messages, "stream": False}
-        code, data = _http_post(url, {"Content-Type":"application/json"}, payload)
-        if code == 200 and isinstance(data, dict):
+                self._new_sdk_cls=None
             try:
-                # Typical Ollama chat format: { "message": {"role":"assistant","content":"..."} }
-                if "message" in data and "content" in data["message"]:
-                    return data["message"]["content"]
-                # Some versions: {"choices":[{"message":{"content":...}}]}
-                if "choices" in data and data["choices"]:
-                    return data["choices"][0].get("message",{}).get("content","")
+                import openai as _old
+                self._old_sdk=_old
             except Exception:
-                pass
-        raise RuntimeError(f"Ollama error ({code}): {data}")
+                self._old_sdk=None
 
-    # default: openai
-    key = _next_openai_key()
-    if not key:
-        raise RuntimeError("No OPENAI_API_KEYS provided")
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
-    payload = {"model": CFG["OPENAI_MODEL"], "messages": messages, "temperature": 0.5}
-    code, data = _http_post("https://api.openai.com/v1/chat/completions", headers, payload)
-    if code == 200 and isinstance(data, dict):
-        try:
-            return data["choices"][0]["message"]["content"]
-        except Exception:
-            pass
-    raise RuntimeError(f"OpenAI error ({code}): {data}")
+    def _pick_key(self)->Optional[str]:
+        if not OPENAI_KEYS: return None
+        k=OPENAI_KEYS[self._key_idx % len(OPENAI_KEYS)]
+        self._key_idx=(self._key_idx+1) % max(1,len(OPENAI_KEYS))
+        return k
 
-def alex_reply(user_id: str, text: str, context: Optional[List[Dict[str,str]]] = None) -> str:
-    """
-    Build the full message list with system persona + short rolling context and query llm_chat().
-    """
-    system = build_system_prompt()
-    msgs: List[Dict[str,str]] = [{"role":"system","content":system}]
-    if context:
-        # carry limited rolling context (last few turns)
-        for m in context[-8:]:
-            if m.get("role") in {"user","assistant"} and "content" in m:
-                msgs.append({"role":m["role"], "content":m["content"]})
-    msgs.append({"role":"user","content":text})
-    db_log_message(user_id, "user", text, {"backend": CFG["BACKEND"]})
-    out = llm_chat(msgs)
-    db_log_message(user_id, "assistant", out, {"backend": CFG["BACKEND"]})
-    return out
+    def chat(self, messages:List[Dict[str,Any]], model:str=None, max_tokens:int=800, timeout:float=60.0)->str:
+        model=model or (OPENAI_MODEL if self.backend=="openai" else OLLAMA_MODEL)
+        if self.backend=="ollama":
+            try:
+                payload={"model":model,"messages":messages,"stream":False}
+                r=self._session.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
+                r.raise_for_status(); j=r.json()
+                if "message" in j and "content" in j["message"]: return (j["message"]["content"] or "").strip()
+                if "response" in j: return (j["response"] or "").strip()
+                return "⚠️ Ollama: unexpected response."
+            except Exception as e:
+                logger.exception("Ollama chat error"); return f"⚠️ Ollama error: {e}"
 
-# ----------- OCR helper -----------
-def run_ocr(image_bytes: bytes) -> str:
-    if not (pytesseract and Image and CFG["ENABLE_OCR"]):
-        return "OCR not available on this deployment."
+        # OpenAI path
+        if not OPENAI_KEYS: return "⚠️ OPENAI_API_KEY(S) not set."
+        attempts=max(3, len(OPENAI_KEYS)); base_sleep=1.2
+        for i in range(attempts):
+            key=self._pick_key()
+            try:
+                if self._new_sdk_cls:
+                    cli=self._new_sdk_cls(api_key=key)
+                    r=cli.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
+                    return (r.choices[0].message.content or "").strip()
+                elif self._old_sdk:
+                    self._old_sdk.api_key=key
+                    r=self._old_sdk.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens, request_timeout=timeout)
+                    return (r["choices"][0]["message"]["content"] or "").strip()
+                else:
+                    return "⚠️ OpenAI SDK not available."
+            except Exception as e:
+                msg=str(e).lower()
+                retriable=any(t in msg for t in ["rate limit","quota","429","timeout","temporarily","connection","service unavailable"])
+                logger.warning("OpenAI attempt %d/%d failed: %s", i+1, attempts, e)
+                if i<attempts-1 and retriable:
+                    time.sleep(base_sleep*(2**i)+random.random()*0.5)
+                    continue
+                return f"⚠️ OpenAI error: {e}"
+        return "⚠️ OpenAI: all attempts failed."
+
+AI=AIBackend(BACKEND)
+
+async def ask_ai(prompt:str, context:str="")->str:
+    return AI.chat([{"role":"system","content":context or "You are Alex — concise, helpful, a little witty."},
+                    {"role":"user","content":prompt}], max_tokens=800)
+
+# Jarvis: alternate persona (command /jarvis)
+async def ask_jarvis(prompt:str)->str:
+    ctx=("You are Jarvis — proactive, witty, and decisive. Prefer bullet action steps, keep answers crisp. "
+         "If code is needed, show only essentials. Assume power-user context.")
+    return AI.chat([{"role":"system","content":ctx},{"role":"user","content":prompt}], max_tokens=800)
+
+# Heartbeat writer
+def write_heartbeat():
     try:
-        from io import BytesIO
-        img = Image.open(BytesIO(image_bytes))  # type: ignore
-        txt = pytesseract.image_to_string(img)  # type: ignore
-        return txt.strip() or "(no text found)"
+        HEARTBEAT.write_text(f"alive {datetime.utcnow().isoformat()}Z | backend={BACKEND}\n", encoding="utf-8")
     except Exception as e:
-        return f"OCR failed: {e}"
+        logger.debug(f"Heartbeat write failed: {e}")
+        # ---------- SQLite memory ----------
+DB_PATH="alex_memory.db"; conn=sqlite3.connect(DB_PATH, check_same_thread=False); cur=conn.cursor()
+cur.execute("""CREATE TABLE IF NOT EXISTS raw_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, type TEXT NOT NULL, text TEXT NOT NULL, meta TEXT)""")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_events(ts)")
+cur.execute("""CREATE TABLE IF NOT EXISTS notes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, source TEXT NOT NULL, topic_key TEXT NOT NULL,
+  title TEXT, content TEXT NOT NULL, tags TEXT, sentiment TEXT, raw_ref TEXT)""")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)"); conn.commit()
 
-# ----------- Voice helpers (safe stubs) -----------
-def jarvis_listen(timeout: int = 7) -> str:
-    if not (CFG["ENABLE_SPEECH"] and sr):
-        return ""
+RAW_JSONL=Path("raw_events.jsonl")
+def _append_jsonl(obj:dict):
     try:
-        r = sr.Recognizer()  # type: ignore
-        with sr.Microphone() as source:  # type: ignore
-            r.adjust_for_ambient_noise(source, duration=0.5)
-            audio = r.listen(source, timeout=timeout)  # type: ignore
-        return r.recognize_google(audio)  # type: ignore
-    except Exception as e:
-        log.warning(f"listen failed: {e}")
-        return ""
+        with RAW_JSONL.open("a", encoding="utf-8") as f: f.write(json.dumps(obj, ensure_ascii=False)+"\n")
+    except Exception as e: logger.error("JSONL append error: %s", e)
 
-def jarvis_say(text: str):
-    # keep simple to avoid binary deps; we log instead
-    if CFG["ENABLE_TTS"] and pydub:
-        # You can plug in your TTS wav/bytes here and play with pydub.playback
-        log.info(f"(TTS) {text[:200]}")
-    else:
-        log.info(f"(say) {text[:200]}")
-# ----------- Telegram bot wiring -----------
+def log_raw(ev_type:str, text:str, meta:dict|None=None)->int:
+    ts=datetime.utcnow().isoformat(); m=json.dumps(meta or {}, ensure_ascii=False)
+    cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m)); conn.commit()
+    rid=cur.lastrowid; _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
+    logger.info("raw[%s] %s: %s", rid, ev_type, (text[:200]+"…") if len(text)>200 else text); return rid
 
-# We support python-telegram-bot v20+
-try:
-    from telegram import Update, MessageEntity
-    from telegram.constants import ChatAction, ParseMode
-    from telegram.ext import (
-        Application, ApplicationBuilder, CommandHandler, MessageHandler,
-        ContextTypes, filters, CallbackContext
-    )
-except Exception as e:
-    Update = None  # type: ignore
-    log.warning("telegram libraries not available. Telegram features disabled.")
+# summarization + topic merge
+def _topic_key(text:str)->str:
+    seed=re.sub(r"[^a-z0-9 ]+"," ",re.sub(r"https?://\S+","",text.lower())); seed=" ".join(seed.split()[:12])
+    return hashlib.sha1(seed.encode()).hexdigest()
 
-# ---- small utilities ----
-def is_admin(user_id: int) -> bool:
-    return (user_id in CFG["ADMIN_IDS"]) if CFG["ADMIN_IDS"] else True  # default open if no list
-
-def ctx_key(chat_id: int) -> str:
-    return f"ctx:{chat_id}"
-
-def get_ctx(chat_id: int) -> List[Dict[str, str]]:
-    return mget(ctx_key(chat_id), [])
-
-def push_ctx(chat_id: int, role: str, content: str, max_len: int = 16):
-    ctx = get_ctx(chat_id)
-    ctx.append({"role": role, "content": content})
-    if len(ctx) > max_len:
-        ctx = ctx[-max_len:]
-    mset(ctx_key(chat_id), ctx)
-
-async def send_typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _merge_contents(old:str, new:str)->str:
     try:
-        await update.effective_chat.send_action(ChatAction.TYPING)  # type: ignore
-    except Exception:
-        pass
-
-def md_escape(s: str) -> str:
-    # basic sanitation for MarkdownV2 / HTML; we’re using HTML by default
-    return s
-
-# ---- command handlers ----
-HELP_TEXT = (
-    "🤖 <b>Alex / Jarvis</b>\n"
-    "• Simply send a message to chat.\n"
-    "• Send an image to run OCR (if enabled).\n"
-    "• Voice input is optional and may be disabled on this server.\n\n"
-    "<b>Commands</b>\n"
-    "/start – Status & hello\n"
-    "/help – This help\n"
-    "/reset – Clear context\n"
-    "/mode jarvis|plain – Toggle persona\n"
-    "/humane on|off – Gentle tone\n"
-    "/unrestrict on|off – Looser style (still safe)\n"
-    "/backend openai|ollama – Select provider\n"
-    "/model <name> – Set model for current backend\n"
-    "/ocr on|off – Enable/disable OCR\n"
-    "/tts on|off – Enable/disable simple TTS logs\n"
-    "/stats – Basic stats\n"
-)
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_typing(update, context)
-    info = (
-        f"<b>Backend:</b> {CFG['BACKEND']}<br>"
-        f"<b>Model:</b> {CFG['OPENAI_MODEL'] if CFG['BACKEND']=='openai' else CFG['OLLAMA_MODEL']}<br>"
-        f"<b>Jarvis:</b> {CFG['JARVIS_MODE']} | <b>Humane:</b> {CFG['HUMANE_TONE']} | "
-        f"<b>Unrestrict:</b> {CFG['UNRESTRICTED_HINT']}<br>"
-        f"<b>OCR:</b> {bool(CFG['ENABLE_OCR'] and pytesseract and Image)} | "
-        f"<b>Speech:</b> {bool(CFG['ENABLE_SPEECH'] and sr)} | "
-        f"<b>TTS:</b> {CFG['ENABLE_TTS']}"
-    )
-    await update.effective_message.reply_html("👋 Hey! I’m <b>Alex</b> (Jarvis mode capable).\n\n" + info + "\n\n" + HELP_TEXT)
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_html(HELP_TEXT)
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mset(ctx_key(update.effective_chat.id), [])  # type: ignore
-    await update.effective_message.reply_text("Context cleared.")
-
-async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):  # type: ignore
-        return await update.effective_message.reply_text("Only admins can change mode.")
-    arg = (context.args[0].lower() if context.args else "")
-    if arg in {"jarvis", "on"}:
-        CFG["JARVIS_MODE"] = True
-    elif arg in {"plain", "off"}:
-        CFG["JARVIS_MODE"] = False
-    else:
-        return await update.effective_message.reply_text("Usage: /mode jarvis|plain")
-    await update.effective_message.reply_text(f"Jarvis mode = {CFG['JARVIS_MODE']}")
-    log.info(f"Jarvis mode -> {CFG['JARVIS_MODE']}")
-
-async def cmd_humane(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):  # type: ignore
-        return await update.effective_message.reply_text("Only admins can change tone.")
-    arg = (context.args[0].lower() if context.args else "")
-    if arg in {"on","true"}:
-        CFG["HUMANE_TONE"] = True
-    elif arg in {"off","false"}:
-        CFG["HUMANE_TONE"] = False
-    else:
-        return await update.effective_message.reply_text("Usage: /humane on|off")
-    await update.effective_message.reply_text(f"Humane tone = {CFG['HUMANE_TONE']}")
-
-async def cmd_unrestrict(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):  # type: ignore
-        return await update.effective_message.reply_text("Only admins can change style.")
-    arg = (context.args[0].lower() if context.args else "")
-    if arg in {"on","true"}:
-        CFG["UNRESTRICTED_HINT"] = True
-    elif arg in {"off","false"}:
-        CFG["UNRESTRICTED_HINT"] = False
-    else:
-        return await update.effective_message.reply_text("Usage: /unrestrict on|off")
-    await update.effective_message.reply_text(f"Unrestricted style hint = {CFG['UNRESTRICTED_HINT']}")
-
-async def cmd_backend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):  # type: ignore
-        return await update.effective_message.reply_text("Only admins can change backend.")
-    arg = (context.args[0].lower() if context.args else "")
-    if arg not in {"openai","ollama"}:
-        return await update.effective_message.reply_text("Usage: /backend openai|ollama")
-    CFG["BACKEND"] = arg
-    await update.effective_message.reply_text(f"Backend set to {CFG['BACKEND']}")
-
-async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):  # type: ignore
-        return await update.effective_message.reply_text("Only admins can change model.")
-    if not context.args:
-        return await update.effective_message.reply_text("Usage: /model <model_name>")
-    name = " ".join(context.args)
-    if CFG["BACKEND"] == "openai":
-        CFG["OPENAI_MODEL"] = name
-    else:
-        CFG["OLLAMA_MODEL"] = name
-    await update.effective_message.reply_text(f"Model set to {name} for {CFG['BACKEND']}")
-
-async def cmd_ocr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):  # type: ignore
-        return await update.effective_message.reply_text("Only admins can toggle OCR.")
-    arg = (context.args[0].lower() if context.args else "")
-    if arg in {"on","true"}:
-        CFG["ENABLE_OCR"] = True
-    elif arg in {"off","false"}:
-        CFG["ENABLE_OCR"] = False
-    else:
-        return await update.effective_message.reply_text("Usage: /ocr on|off")
-    await update.effective_message.reply_text(f"OCR = {CFG['ENABLE_OCR']}")
-
-async def cmd_tts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):  # type: ignore
-        return await update.effective_message.reply_text("Only admins can toggle TTS.")
-    arg = (context.args[0].lower() if context.args else "")
-    if arg in {"on","true"}:
-        CFG["ENABLE_TTS"] = True
-    elif arg in {"off","false"}:
-        CFG["ENABLE_TTS"] = False
-    else:
-        return await update.effective_message.reply_text("Usage: /tts on|off")
-    await update.effective_message.reply_text(f"TTS = {CFG['ENABLE_TTS']}")
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # lightweight stats
-    messages = 0
-    try:
-        if CFG["PERSIST_SQLITE"]:
-            conn = sqlite3.connect(DB); cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM messages"); messages = cur.fetchone()[0]
-            conn.close()
-    except Exception:
-        pass
-    await update.effective_message.reply_html(
-        f"<b>Stats</b>\nMessages stored: <b>{messages}</b>\nBackend: <b>{CFG['BACKEND']}</b>")
-
-# ---- message routing ----
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id  # type: ignore
-    text = update.effective_message.text or ""  # type: ignore
-    if not text.strip():
-        return
-    await send_typing(update, context)
-    push_ctx(chat_id, "user", text)
-    try:
-        answer = alex_reply(str(chat_id), text, get_ctx(chat_id))
-    except Exception as e:
-        log.error(f"LLM error: {e}")
-        answer = f"Oops, provider error: {e}"
-    push_ctx(chat_id, "assistant", answer)
-    await update.effective_message.reply_html(md_escape(answer))
-
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not CFG["ENABLE_OCR"]:
-        return await update.effective_message.reply_text("OCR disabled on this server.")
-    if not (pytesseract and Image):
-        return await update.effective_message.reply_text("OCR library not available here.")
-    try:
-        await send_typing(update, context)
-        photo = update.message.photo[-1]  # type: ignore
-        file = await photo.get_file()
-        b = await file.download_as_bytearray()
-        ocr_text = run_ocr(bytes(b))
-        await update.effective_message.reply_text(f"OCR:\n{ocr_text[:4000]}")
-        if ocr_text.strip():
-            chat_id = update.effective_chat.id  # type: ignore
-            push_ctx(chat_id, "user", f"(image OCR) {ocr_text[:2000]}")
-            answer = alex_reply(str(chat_id), f"Here is text I extracted: {ocr_text[:2000]}", get_ctx(chat_id))
-            push_ctx(chat_id, "assistant", answer)
-            await update.effective_message.reply_html(md_escape(answer))
-    except Exception as e:
-        log.error(f"OCR fail: {e}")
-        await update.effective_message.reply_text(f"OCR failed: {e}")
-
-async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # We don't transcribe server-side unless ASR is installed and enabled.
-    if not (CFG["ENABLE_SPEECH"] and sr):
-        return await update.effective_message.reply_text("Voice input not available on this server.")
-    await update.effective_message.reply_text("Voice recognition is not configured for Telegram uploads here yet.")
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Telegram error", exc_info=context.error)
-
-# ---- builder ----
-def build_app() -> Optional[Application]:
-    if Update is None or not CFG["TELEGRAM_TOKEN"]:
-        log.warning("Telegram not configured; skipping bot init.")
-        return None
-    app = ApplicationBuilder().token(CFG["TELEGRAM_TOKEN"]).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("humane", cmd_humane))
-    app.add_handler(CommandHandler("unrestrict", cmd_unrestrict))
-    app.add_handler(CommandHandler("backend", cmd_backend))
-    app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("ocr", cmd_ocr))
-    app.add_handler(CommandHandler("tts", cmd_tts))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-
-    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_error_handler(on_error)
-
-    return app
-    # ========== Alex Mega.py (Part 3/4) ==========
-
-# =====================
-# OCR & IMAGE PROCESSING
-# =====================
-def extract_text_from_image(image_path: str) -> str:
-    """Extract text from images using pytesseract OCR."""
-    if not OCR_AVAILABLE:
-        logger.warning("OCR not available. Please install tesseract.")
-        return ""
-    try:
-        text = pytesseract.image_to_string(Image.open(image_path))
-        logger.info(f"OCR extracted text: {text[:100]}...")
-        return text
-    except Exception as e:
-        logger.error(f"OCR failed: {e}")
-        return ""
-
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle image uploads in Telegram and return OCR text."""
-    try:
-        file = await update.message.photo[-1].get_file()
-        filepath = f"downloads/{file.file_id}.jpg"
-        os.makedirs("downloads", exist_ok=True)
-        await file.download_to_drive(filepath)
-        text = extract_text_from_image(filepath)
-        await update.message.reply_text(f"📝 OCR Result:\n\n{text if text else 'No text found.'}")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error processing image: {e}")
-
-# =====================
-# JARVIS / HUMANE TONE
-# =====================
-def format_response(text: str, jarvis: bool = JARVIS_MODE, humane: bool = HUMANE_TONE) -> str:
-    """Format AI responses based on Jarvis or Humane tone flags."""
-    if jarvis:
-        return f"🤖 Jarvis: {text}"
-    elif humane:
-        return f"{text} 🙂"
-    else:
-        return text
-
-# =====================
-# TELEGRAM BOT HANDLERS
-# =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Alex is online and ready!")
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Echo back messages with AI response style."""
-    user_text = update.message.text
-    ai_reply = format_response(f"You said: {user_text}")
-    await update.message.reply_text(ai_reply)
-
-async def toggle_jarvis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global JARVIS_MODE
-    JARVIS_MODE = not JARVIS_MODE
-    await update.message.reply_text(f"Jarvis mode is now {'ON' if JARVIS_MODE else 'OFF'}.")
-
-async def toggle_humane(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global HUMANE_TONE
-    HUMANE_TONE = not HUMANE_TONE
-    await update.message.reply_text(f"Humane tone is now {'ON' if HUMANE_TONE else 'OFF'}.")
-
-# =====================
-# BACKEND CHAT FUNCTION
-# =====================
-async def generate_response(prompt: str) -> str:
-    """Generate AI response using OpenAI backend with fallback."""
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7
-            },
-            timeout=30
+        return AI.chat(
+            [{"role":"system","content":"Merge NEW into EXISTING. ≤120 words, bullets ok. Preserve key facts/numbers."},
+             {"role":"user","content":f"EXISTING:\n{old}\n\nNEW:\n{new}"}],
+            max_tokens=240
         )
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"].strip()
-        return format_response(text)
+    except Exception:
+        return (old+"\n"+new)[:1200]
+
+def _humane_summarize(text:str, capture_tone:bool=True)->dict:
+    sysmsg="Compress into human memory: 3–6 bullets or 2–4 short sentences; essentials only."
+    if capture_tone and HUMANE_TONE: sysmsg+=" Detect tone (positive/neutral/negative + brief)."
+    prompt=f"Digest this into humane memory.\n\nTEXT:\n{text}\n\nReturn JSON: title, summary, tags (3-6), sentiment."
+    try:
+        out=AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=360)
+        try: data=json.loads(out)
+        except Exception: data={"title":"","summary":out.strip(),"tags":"","sentiment":""}
+        return {"title":(data.get("title") or "")[:120],"summary":(data.get("summary") or out).strip(),
+                "tags":(data.get("tags") or "").replace("\n"," ").strip(),"sentiment":(data.get("sentiment") or "").strip()}
+    except Exception:
+        return {"title":"","summary":text[:900],"tags":"","sentiment":""}
+
+def remember(source:str, text:str, raw_ref:str="")->int:
+    digest=_humane_summarize(text, True); topic=_topic_key(digest["summary"] or text)
+    cur.execute("SELECT id, content FROM notes WHERE topic_key=? ORDER BY id DESC LIMIT 1",(topic,)); row=cur.fetchone()
+    if row:
+        nid, existing=row; merged=_merge_contents(existing, digest["summary"])
+        cur.execute("""UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=?,raw_ref=? WHERE id=?""",
+                    (datetime.utcnow().isoformat(),source,digest["title"],merged,digest["tags"],digest["sentiment"],raw_ref,nid))
+        conn.commit(); return nid
+    cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (datetime.utcnow().isoformat(),source,topic,digest["title"],digest["summary"],digest["tags"],digest["sentiment"],raw_ref))
+    conn.commit(); return cur.lastrowid
+
+# ---------- simple lexical search ----------
+_WORD_RE=re.compile(r"[a-z0-9]+")
+def _tokenize(s:str)->List[str]: return _WORD_RE.findall(s.lower())
+def _tf(tokens:List[str])->Dict[str,float]:
+    d={}; n=float(len(tokens)) or 1.0
+    for t in tokens: d[t]=d.get(t,0)+1.0
+    for k in d: d[k]/=n
+    return d
+def _cosine(a:Dict[str,float], b:Dict[str,float])->float:
+    if not a or not b: return 0.0
+    common=set(a)&set(b); num=sum(a[t]*b[t] for t in common)
+    da=math.sqrt(sum(v*v for v in a.values())); db=math.sqrt(sum(v*v for v in b.values()))
+    return 0.0 if da==0 or db==0 else num/(da*db)
+
+def search_memory(query:str, k_raw:int=12, k_notes:int=12)->dict:
+    qtf=_tf(_tokenize(query))
+    cur.execute("SELECT id,ts,type,text,meta FROM raw_events ORDER BY id DESC LIMIT 4000")
+    raw_scored=[]
+    for r in cur.fetchall():
+        txt=r[3] or ""; score=_cosine(qtf,_tf(_tokenize(txt)))
+        if score>0: raw_scored.append((score,{"id":r[0],"ts":r[1],"type":r[2],"text":txt,"meta":r[4]}))
+    raw_top=[x[1] for x in sorted(raw_scored,key=lambda z:z[0],reverse=True)[:k_raw]]
+
+    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id DESC LIMIT 4000")
+    note_scored=[]
+    for r in cur.fetchall():
+        txt=(r[4] or "")+" "+(r[3] or "")+" "+(r[5] or "")
+        score=_cosine(qtf,_tf(_tokenize(txt)))
+        if score>0:
+            note_scored.append((score,{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4] or "",
+                                       "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""}))
+    notes_top=[x[1] for x in sorted(note_scored,key=lambda z:z[0],reverse=True)[:k_notes]]
+    return {"raw":raw_top,"notes":notes_top}
+
+def build_context_blurb(found:dict, max_chars:int=3800)->str:
+    parts=[]
+    for n in found.get("notes",[]):
+        blk=f"[NOTE #{n['id']} | {n['ts']} | {n['source']} | {n['title']}] {n['content']}"
+        if n["tags"]: blk+=f" (tags: {n['tags']})"
+        parts.append(blk)
+    for r in found.get("raw",[]):
+        txt=r["text"]; txt=txt[:600]+"…" if len(txt)>600 else txt
+        parts.append(f"[RAW #{r['id']} | {r['ts']} | {r['type']}] {txt}")
+    return "\n\n".join(parts)[:max_chars]
+
+async def rag_answer(question:str)->str:
+    found=search_memory(question,k_raw=10,k_notes=10); ctx=build_context_blurb(found)
+    prompt=f"""Use the CONTEXT to answer the QUESTION.
+- Be concise and actionable; cite ids like (NOTE #12) or (RAW #99).
+- If conflicts, state best-supported view & mention uncertainty.
+- If missing, say what else is needed.
+
+CONTEXT:
+{ctx}
+
+QUESTION:
+{question}
+"""
+    return await ask_ai(prompt, context="You are Alex — precise, synthesizes across memory, cites context ids.")
+
+# ---------- URL crawler + SEO summariser ----------
+async def fetch_url(url:str)->str:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"}) as r:
+                if r.status!=200: return f"⚠️ HTTP {r.status}"
+                text=await r.text()
+        soup=BeautifulSoup(text,"html.parser")
+        title=soup.title.string.strip() if soup.title and soup.title.string else "No title"
+        desc=(soup.find("meta",{"name":"description"}) or {}).get("content","")
+        h1=soup.h1.get_text(strip=True) if soup.h1 else ""
+        words=len(soup.get_text(' ').split()); links=len(soup.find_all("a")); images=len(soup.find_all("img"))
+        snippet=soup.get_text(" ")[:1800]
+        return f"🌐 {title}\nDesc: {desc[:200]}\nH1: {h1}\nWords:{words} Links:{links} Images:{images}\n\nSnippet:\n{snippet}"
     except Exception as e:
-        logger.error(f"OpenAI request failed: {e}")
-        return format_response("⚠️ Sorry, I couldn't process that request.")
-        # ========== Alex Mega.py (Part 4/4) ==========
+        logger.exception("Crawl error"); return f"⚠️ Crawl error: {e}"
 
-# =====================
-# TELEGRAM BOT SETUP
-# =====================
-def run_telegram_bot():
-    if not TELEGRAM_TOKEN:
-        logger.warning("No Telegram token set. Skipping Telegram bot startup.")
-        return
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+async def analyze_url(url:str)->str:
+    content=await fetch_url(url)
+    if content.startswith("⚠️"): return content
+    summary=await ask_ai("Summarize page in short bullets; key entities, actions, SEO opportunities:\n\n"+content)
+    log_raw("link", summary, {"url":url}); remember("link", summary, raw_ref=url); return summary
 
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("jarvis", toggle_jarvis))
-    application.add_handler(CommandHandler("humane", toggle_humane))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_image))
+# ---------- File analyzers ----------
+def analyze_excel(path:Path)->str:
+    try:
+        df=pd.read_excel(path); head=", ".join(map(str,list(df.columns)[:12]))
+        info=f"✅ Excel loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head}"
+        num=df.select_dtypes(include="number")
+        if not num.empty: info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
+        log_raw("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file":str(path)})
+        remember("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
+        return info
+    except Exception as e: logger.exception("Excel analysis error"); return f"⚠️ Excel analysis error: {e}"
 
-    logger.info("Starting Telegram bot...")
-    application.run_polling()
+def analyze_csv(path:Path)->str:
+    try:
+        df=pd.read_csv(path, nrows=50000); head=", ".join(map(str,list(df.columns)[:12]))
+        info=f"✅ CSV loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head}"
+        num=df.select_dtypes(include="number")
+        if not num.empty: info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
+        log_raw("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file":str(path)})
+        remember("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
+        return info
+    except Exception as e: logger.exception("CSV analysis error"); return f"⚠️ CSV analysis error: {e}"
 
-# =====================
-# FLASK / KEEP-ALIVE SERVER
-# =====================
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        self.wfile.write(b"<h1>✅ Alex is alive</h1>")
+def analyze_json(path:Path)->str:
+    try:
+        raw=path.read_text(encoding="utf-8", errors="ignore"); data=json.loads(raw)
+        if isinstance(data,list): shape=f"list[{len(data)}]"; preview=json.dumps(data[:3], ensure_ascii=False)[:1500]
+        elif isinstance(data,dict): shape=f"dict({len(data.keys())} keys)"; preview=json.dumps({k:data[k] for k in list(data.keys())[:10]}, ensure_ascii=False)[:1500]
+        else: shape=type(data).__name__; preview=str(data)[:1500]
+        info=f"✅ JSON loaded: {shape}\nPreview: {preview}"
+        log_raw("file", f"JSON {path.name}: shape {shape}", {"file":str(path)})
+        remember("file", f"JSON {path.name}: shape {shape}\nPreview: {preview}", raw_ref=str(path))
+        return info
+    except Exception as e: logger.exception("JSON analysis error"); return f"⚠️ JSON analysis error: {e}"
 
-def run_keep_alive_server(port=8080):
-    server = HTTPServer(("", port), SimpleHandler)
-    logger.info(f"Keep-alive server running on port {port}")
-    server.serve_forever()
+# ---------- Image analyzer (EXIF + optional OCR) ----------
+def _exif_dict(im:Image.Image)->dict:
+    try:
+        exif=im._getexif() or {}; label={ExifTags.TAGS.get(k,k):v for k,v in exif.items()}
+        keep={}
+        for k in ["DateTime","Make","Model","Software","LensModel","Orientation","ExifVersion","XResolution","YResolution"]:
+            if k in label: keep[k]=label[k]
+        return keep
+    except Exception:
+        return {}
 
-# =====================
-# MAIN ENTRYPOINT
-# =====================
-def main():
-    logger.info("🚀 Starting Alex Mega.py...")
-    threads = []
+def analyze_image(path:Path)->str:
+    meta={"file":str(path)}
+    try:
+        im=Image.open(path); exif=_exif_dict(im); meta["exif"]=exif
+        if HAS_TESS:
+            try:
+                import pytesseract; ocr=pytesseract.image_to_string(im) or ""
+            except Exception as e: ocr=f"(OCR unavailable: {e})"
+        else: ocr="(OCR module not installed)"
+        rid=log_raw("image", ocr if ocr else "(no OCR text)", meta)
+        gist=f"Image {path.name}: EXIF {exif if exif else '∅'}; OCR preview: {(ocr[:500]+'…') if ocr and len(ocr)>500 else (ocr or '∅')}"
+        remember("image", gist, raw_ref=str(path))
+        return f"🖼️ Image saved. EXIF keys: {list(exif.keys()) if exif else 'none'}. OCR length: {len(ocr)} chars. (raw id {rid})"
+    except Exception as e:
+        log_raw("image", f"Image load error {path.name}: {e}", {"file": str(path)})
+        logger.exception("Image analysis error"); return f"⚠️ Image analysis error: {e}"
+        # ---------- Telegram handlers ----------
+GLOBAL_APP:Application|None=None
+MEM_RUNTIME={"log_path":"", "subscribers": []}
 
-    # Start keep-alive HTTP server
-    t_server = threading.Thread(target=run_keep_alive_server, daemon=True)
-    threads.append(t_server)
-    t_server.start()
+# ----- Approval queue for dangerous ops -----
+PENDING_CMDS: Dict[str, Dict[str,Any]] = {}  # id -> {type:'shell'|'py', 'cmd'|'code', 'chat_id'}
 
-    # Start Telegram bot
-    t_bot = threading.Thread(target=run_telegram_bot, daemon=True)
-    threads.append(t_bot)
-    t_bot.start()
+def _owner_only(update:Update)->bool:
+    return OWNER_ID and str(update.effective_user.id)==str(OWNER_ID)
 
-    # Optional: Background monitoring loop
+async def start_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hey, I'm Alex 🤖\n"
+        "Core: /ai <prompt>, /jarvis <prompt>, /ask <question>\n"
+        "Ingest: /analyze <url>, send images & .xlsx/.csv/.json files\n"
+        "Memory: /remember <text>, /mem [n], /exportmem, /raw [n]\n"
+        "Logs: /setlog <path>, /subscribe_logs, /unsubscribe_logs, /logs [n]\n"
+        "Utils: /search <query>, /id, /uptime, /backup, /config\n"
+        "Dangerous ops require owner approval: /queue, /approve <id>, /deny <id>, /shell <cmd>, /py <code>"
+    )
+
+async def id_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Your chat id: `{update.effective_chat.id}`", parse_mode="Markdown")
+
+async def uptime_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    u=int(time.time()-START_TIME); h,m,s=u//3600,(u%3600)//60,u%60
+    await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
+
+async def config_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    flags={"BACKEND":BACKEND,"OPENAI_MODEL":OPENAI_MODEL,"OLLAMA_MODEL":OLLAMA_MODEL,"HUMANE_TONE":HUMANE_TONE,
+           "HAS_TESS":HAS_TESS,"SERPAPI_KEY_set":bool(SERPAPI_KEY),"DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),
+           "PORT":PORT,"USE_OPENAI_STT":USE_OPENAI_STT,"USE_OPENAI_TTS":USE_OPENAI_TTS,"HEARTBEAT":str(HEARTBEAT)}
+    await update.message.reply_text("Config:\n"+json.dumps(flags, indent=2))
+
+async def backup_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    try:
+        zpath=Path("alex_backup.zip")
+        with zipfile.ZipFile(zpath,"w",compression=zipfile.ZIP_DEFLATED) as z:
+            if Path(DB_PATH).exists(): z.write(DB_PATH)
+            if RAW_JSONL.exists(): z.write(RAW_JSONL)
+            manifest={"files":[str(p) for p in SAVE_DIR.glob("*") if p.is_file()]}
+            man_path=Path("received_manifest.json"); man_path.write_text(json.dumps(manifest, indent=2)); z.write(man_path)
+        await update.message.reply_document(document=str(zpath), filename=zpath.name)
+    except Exception as e: logger.exception("Backup error"); await update.message.reply_text(f"Backup error: {e}")
+
+async def ai_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    q=" ".join(ctx.args)
+    if not q: return await update.message.reply_text("Usage: /ai <your prompt>")
+    ans=await ask_ai(q)
+    log_raw("chat_user", q, {"chat_id":update.effective_chat.id}); log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
+    remember("chat", f"Q: {q}\nA gist: {ans[:400]}"); await update.message.reply_text(ans)
+
+async def jarvis_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    q=" ".join(ctx.args)
+    if not q: return await update.message.reply_text("Usage: /jarvis <your prompt>")
+    ans=await ask_jarvis(q)
+    log_raw("chat_user", f"/jarvis {q}", {"chat_id":update.effective_chat.id})
+    log_raw("chat_jarvis", ans, {"chat_id":update.effective_chat.id})
+    remember("jarvis", f"Q: {q}\nA gist: {ans[:400]}"); await update.message.reply_text(ans)
+
+async def ask_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    q=" ".join(ctx.args).strip()
+    if not q: return await update.message.reply_text("Usage: /ask <question about anything I've seen/learned>")
+    log_raw("chat_user", f"/ask {q}", {"chat_id":update.effective_chat.id})
+    ans=await rag_answer(q); log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id}); await update.message.reply_text(ans)
+
+async def search_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not ctx.args: return await update.message.reply_text("Usage: /search <query>")
+    if not SERPAPI_KEY: return await update.message.reply_text("⚠️ SERPAPI_KEY not set.")
+    query=" ".join(ctx.args)
+    try:
+        r=requests.get("https://serpapi.com/search", params={"q":query,"hl":"en","api_key":SERPAPI_KEY}, timeout=25)
+        j=r.json(); snip=j.get("organic_results",[{}])[0].get("snippet","(no results)")
+        out=f"🔎 {query}\n{snip}"
+        log_raw("chat_user", f"/search {query}", {"chat_id":update.effective_chat.id})
+        log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); remember("chat", f"SERP for '{query}': {snip}")
+        await update.message.reply_text(out)
+    except Exception as e: logger.exception("Search error"); await update.message.reply_text(f"Search error: {e}")
+
+async def analyze_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not ctx.args: return await update.message.reply_text("Usage: /analyze <url>")
+    url=ctx.args[0]; await update.message.reply_text("🔍 Crawling and summarizing…")
+    res=await analyze_url(url); await update.message.reply_text(res)
+
+async def remember_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    text=" ".join(ctx.args).strip()
+    if not text: return await update.message.reply_text("Usage: /remember <text to add to memory>")
+    rid=log_raw("chat_user", f"/remember {text}", {"chat_id":update.effective_chat.id})
+    nid=remember("chat", text); await update.message.reply_text(f"🧠 Noted (note id {nid}, raw id {rid}). Essence kept, details in raw log.")
+
+async def mem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    n=8
+    if ctx.args:
+        try: n=max(1,min(40,int(ctx.args[0])))
+        except: pass
+    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id DESC LIMIT ?",(n,))
+    rows=cur.fetchall()
+    if not rows: return await update.message.reply_text("🧠 Memory is empty (for now).")
+    lines=[]
+    for r in rows:
+        lines.append(f"#{r[0]} [{r[2]}] {r[3] or '(no title)'}")
+        lines.append("  "+(r[4] or "").replace("\n","\n  ")[:700])
+        if r[5]: lines.append(f"  tags: {r[5]}")
+        if r[7]: lines.append(f"  ref: {r[7]}")
+        lines.append("")
+    await update.message.reply_text("\n".join(lines)[:3900])
+
+async def exportmem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id ASC")
+    rows=cur.fetchall(); data=[{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4] or "",
+                                "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""} for r in rows]
+    path=Path("memory_export.json"); path.write_text(json.dumps(data, indent=2))
+    await update.message.reply_document(document=str(path), filename="alex_memory.json")
+
+async def raw_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    n=30
+    if ctx.args:
+        try: n=max(1,min(200,int(ctx.args[0])))
+        except: pass
+    cur.execute("SELECT id,ts,type,text,meta FROM raw_events ORDER BY id DESC LIMIT ?",(n,))
+    rows=cur.fetchall()
+    if not rows: return await update.message.reply_text("Raw memory is empty.")
+    out=[]
+    for r in rows:
+        try: meta=json.loads(r[4] or "{}")
+        except: meta={}
+        txt=(r[3] or "").replace("\n"," ")[:800]; mtxt=f" | meta: {meta}" if meta else ""
+        out.append(f"#{r[0]} [{r[1]} | {r[2]}] {txt}{mtxt}")
+    await update.message.reply_text("\n".join(out)[:3900])
+
+# ----- owner approval flow for dangerous ops -----
+async def queue_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not PENDING_CMDS: return await update.message.reply_text("✅ Queue empty.")
+    lines=[]
+    for k,v in PENDING_CMDS.items():
+        lines.append(f"{k} :: {v['type']} :: {(v.get('cmd') or v.get('code'))[:80]}")
+    await update.message.reply_text("\n".join(lines)[:3900])
+
+async def approve_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args: return await update.message.reply_text("Usage: /approve <id>")
+    rid=ctx.args[0].strip()
+    job=PENDING_CMDS.pop(rid, None)
+    if not job: return await update.message.reply_text("Not found.")
+    if job["type"]=="shell":
+        try:
+            result=subprocess.check_output(job["cmd"], shell=True, text=True, stderr=subprocess.STDOUT, timeout=60)
+            await update.message.reply_text(f"💻 OK ({rid})\n{result[:3900]}")
+        except subprocess.CalledProcessError as e:
+            await update.message.reply_text(f"❌ Error ({rid}):\n{(e.output or str(e))[:3900]}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Exec error: {e}")
+    elif job["type"]=="py":
+        try:
+            loc={}; exec(job["code"], {}, loc)  # sandbox-light; trust owner only
+            await update.message.reply_text(f"🐍 Py OK ({rid}) — keys: {list(loc.keys())[:12]}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Py error ({rid}): {e}")
+    else:
+        await update.message.reply_text("Unknown job type.")
+
+async def deny_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args: return await update.message.reply_text("Usage: /deny <id>")
+    rid=ctx.args[0].strip()
+    if rid in PENDING_CMDS:
+        PENDING_CMDS.pop(rid, None); await update.message.reply_text(f"🛑 Denied {rid}.")
+    else:
+        await update.message.reply_text("Not found.")
+
+async def shell_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cmd=" ".join(ctx.args).strip()
+    if not cmd: return await update.message.reply_text("Usage: /shell <command>")
+    job_id=str(uuid.uuid4())[:8]; PENDING_CMDS[job_id]={"type":"shell","cmd":cmd,"chat_id":update.effective_chat.id}
+    await update.message.reply_text(f"⌛ Queued shell command for approval. ID: `{job_id}`", parse_mode="Markdown")
+
+async def py_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    code=" ".join(ctx.args).strip()
+    if not code: return await update.message.reply_text("Usage: /py <single-line python> (multi-line not supported here)")
+    job_id=str(uuid.uuid4())[:8]; PENDING_CMDS[job_id]={"type":"py","code":code,"chat_id":update.effective_chat.id}
+    await update.message.reply_text(f"⌛ Queued python for approval. ID: `{job_id}`", parse_mode="Markdown")
+
+# --- uploads ---
+async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    doc=update.message.document
+    if not doc: return
+    file_path=SAVE_DIR/doc.file_name; tg_file=await ctx.bot.get_file(doc.file_id); await tg_file.download_to_drive(file_path)
+    log_raw("file", f"Received file {doc.file_name}", {"file":str(file_path), "chat_id":update.effective_chat.id})
+    await update.message.reply_text(f"📂 Saved `{doc.file_name}` — analyzing…", parse_mode="Markdown")
+    name=doc.file_name.lower()
+    if   name.endswith(".xlsx"): out=analyze_excel(file_path)
+    elif name.endswith(".csv"):  out=analyze_csv(file_path)
+    elif name.endswith(".json"): out=analyze_json(file_path)
+    else: remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I analyze Excel/CSV/JSON."
+    log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
+
+async def handle_photo(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo: return
+    photo=update.message.photo[-1]; file=await ctx.bot.get_file(photo.file_id)
+    path=SAVE_DIR/f"photo_{photo.file_id}.jpg"; await file.download_to_drive(path)
+    out=analyze_image(path); log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
+
+async def handle_text(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    text=(update.message.text or "").strip()
+    log_raw("chat_user", text, {"chat_id":update.effective_chat.id})
+    if text.startswith(("http://","https://")):
+        await update.message.reply_text("🔍 Got your link — analyzing…"); res=await analyze_url(text)
+        log_raw("chat_alex", res, {"chat_id":update.effective_chat.id}); return await update.message.reply_text(res)
+    ans=await ask_ai(text); remember("chat", f"User said: {text}\nResponse gist: {ans[:400]}")
+    log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id}); await update.message.reply_text(ans)
+
+# ---------- live log watcher ----------
+def _post_to_subscribers(text:str):
+    if not GLOBAL_APP or not MEM_RUNTIME.get("subscribers"): return
+    loop=GLOBAL_APP.bot._application.loop
+    async def _send():
+        for cid in list(MEM_RUNTIME["subscribers"]):
+            try: await GLOBAL_APP.bot.send_message(chat_id=cid, text=text)
+            except Exception: pass
+    try: asyncio.run_coroutine_threadsafe(_send(), loop)
+    except Exception: pass
+
+def watch_logs():
+    last_size=0; last_raw_push=0
     while True:
-        logger.info("✅ Alex heartbeat...")
+        try:
+            write_heartbeat()
+            path=MEM_RUNTIME.get("log_path") or ""
+            if not path or not Path(path).exists(): time.sleep(2); continue
+            p=Path(path); sz=p.stat().st_size
+            if sz<last_size: last_size=0
+            if sz>last_size:
+                with p.open("r", errors="ignore") as f:
+                    if last_size: f.seek(last_size)
+                    new=f.read(); last_size=sz
+                for line in new.splitlines():
+                    s=summarize_trade_line(line)
+                    if s:
+                        _post_to_subscribers(s); log_raw("log", line, {"path":path}); remember("log", s, raw_ref=path)
+                    now=time.time()
+                    if now-last_raw_push>15:
+                        last_raw_push=now; _post_to_subscribers("📜 "+line[:900])
+        except Exception as e:
+            logger.error("log watcher error: %s", e)
+        time.sleep(1)
+
+# ---------- persona synthesis worker ----------
+def learning_worker():
+    while True:
+        try:
+            cur.execute("SELECT content FROM notes ORDER BY id DESC LIMIT 24"); rec=[r[0] for r in cur.fetchall()]
+            if rec:
+                persona=AI.chat(
+                    [{"role":"system","content":"Create concise persona guidance from these snippets. 4–6 bullets."},
+                     {"role":"user","content":"\n\n".join(rec)}],
+                    max_tokens=220
+                )
+                tk="__persona__"; cur.execute("SELECT id FROM notes WHERE topic_key=? ORDER BY id DESC LIMIT 1",(tk,)); row=cur.fetchone()
+                if row:
+                    cur.execute("UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=? WHERE id=?",
+                                (datetime.utcnow().isoformat(),"system","Persona",persona,"persona,profile","",row[0]))
+                else:
+                    cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
+                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                (datetime.utcnow().isoformat(),"system",tk,"Persona",persona,"persona,profile","",""))
+                conn.commit()
+        except Exception as e: logger.error("learning error: %s", e)
         time.sleep(60)
 
-if __name__ == "__main__":
+# ---------- Simple STT/TTS scaffolding (OpenAI-only, optional) ----------
+def transcribe_bytes_wav(b:bytes)->str:
+    if BACKEND!="openai" or not USE_OPENAI_STT: return ""
     try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("🛑 Alex shutting down...")
+        from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tf.write(b); tf.flush(); path=tf.name
+        with open(path,"rb") as fh:
+            r=cli.audio.transcriptions.create(model="whisper-1", file=fh)
+        return (r.text or "").strip()
+    except Exception as e:
+        logger.warning("STT error: %s", e); return ""
+
+def tts_to_mp3(text:str)->bytes:
+    if BACKEND!="openai" or not USE_OPENAI_TTS: return b""
+    try:
+        from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
+        r=cli.audio.speech.create(model="gpt-4o-mini-tts", voice=OPENAI_TTS_VOICE, input=text, format="mp3")
+        # SDKs vary; prefer bytes
+        if hasattr(r, "read"): return r.read()
+        return getattr(r, "content", b"") or b""
+    except Exception as e:
+        logger.warning("TTS error: %s", e); return b""
+
+# ---------- Keep-alive HTTP + iOS Shortcuts webhook ----------
+class Health(BaseHTTPRequestHandler):
+    def _ok(self, body:bytes=b"ok", code:int=200, ctype:str="text/plain"):
+        self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(body)
+
+    def do_GET(self):
+        path=urlparse(self.path).path
+        if path=="/": return self._ok(b"ok")
+        if path=="/health": return self._ok(b"ok")
+        # simple status
+        if path=="/status":
+            try:
+                facts=cur.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+            except Exception:
+                facts=0
+            msg=f"Alex alive {datetime.utcnow().isoformat()}Z\nbackend={BACKEND}\nfacts={facts}\n"
+            return self._ok(msg.encode("utf-8"))
+        return self._ok(b"not found", 404)
+
+    def do_POST(self):
+        path=urlparse(self.path).path
+        try:
+            length=int(self.headers.get("Content-Length","0"))
+            raw=self.rfile.read(length) if length>0 else b""
+            data=json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            data={}
+        # /shortcut — called from iOS/Apple Watch Shortcuts
+        if path=="/shortcut":
+            if not SHORTCUT_SECRET or data.get("secret")!=SHORTCUT_SECRET:
+                return self._ok(b'{"error":"unauthorized"}', 401, "application/json")
+            q=(data.get("q") or "").strip()
+            if not q: return self._ok(b'{"error":"missing q"}', 400, "application/json")
+            ans=AI.chat([{"role":"system","content":"You are Alex — concise, helpful, voice-friendly."},
+                         {"role":"user","content":q}], max_tokens=300)
+            remember("shortcut", f"Q: {q}\nA: {ans[:400]}")
+            # Optional TTS (base64 fix)
+            audio_bytes=tts_to_mp3(ans) if USE_OPENAI_TTS else b""
+            audio_b64=base64.b64encode(audio_bytes).decode("ascii") if audio_bytes else ""
+            body={"answer":ans, "audio_base64": audio_b64}
+            return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
+        return self._ok(b"not found", 404)
+
+def start_health(): HTTPServer(("0.0.0.0", PORT), Health).serve_forever()
+
+# ---------- Trading log parsing ----------
+TRADE_PATTERNS=[
+    re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
+    re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
+]
+def summarize_trade_line(line:str)->str|None:
+    for pat in TRADE_PATTERNS:
+        m=pat.search(line)
+        if m:
+            side,sym,qty,price=list(m.groups())
+            try: qty_i=int(qty)
+            except: qty_i=qty
+            return f"🟢 {side.upper()} {sym} qty {qty_i} @ {price}"
+    return None
+
+async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    n=40
+    if ctx.args:
+        try: n=max(1,min(400,int(ctx.args[0])))
+        except: pass
+    path=MEM_RUNTIME.get("log_path") or ""; p=Path(path)
+    if not path or not p.exists(): return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
+    try:
+        lines=p.read_text(errors="ignore").splitlines()[-n:]; msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e: logger.exception("logs read error"); await update.message.reply_text(f"Read error: {e}")
+
+async def setlog_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not ctx.args: return await update.message.reply_text("Usage: /setlog /path/to/your.log")
+    path=" ".join(ctx.args); MEM_RUNTIME["log_path"]=path
+    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
+
+async def subscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cid=update.effective_chat.id
+    if cid not in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].append(cid)
+    await update.message.reply_text("🔔 Subscribed to live log updates.")
+
+async def unsubscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cid=update.effective_chat.id
+    if cid in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].remove(cid)
+    await update.message.reply_text("🔕 Unsubscribed.")
+    # ---------- Wire up Telegram + background threads ----------
+def build_app()->Application:
+    app=Application.builder().token(TELEGRAM_TOKEN).build()
+    # commands
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("uptime", uptime_cmd))
+    app.add_handler(CommandHandler("config", config_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("jarvis", jarvis_cmd))
+    app.add_handler(CommandHandler("ask", ask_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("analyze", analyze_cmd))
+    app.add_handler(CommandHandler("remember", remember_cmd))
+    app.add_handler(CommandHandler("mem", mem_cmd))
+    app.add_handler(CommandHandler("exportmem", exportmem_cmd))
+    app.add_handler(CommandHandler("raw", raw_cmd))
+    app.add_handler(CommandHandler("setlog", setlog_cmd))
+    app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))
+    app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
+    app.add_handler(CommandHandler("logs", logs_cmd))
+    # approval / dangerous ops
+    app.add_handler(CommandHandler("queue", queue_cmd))
+    app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("deny", deny_cmd))
+    app.add_handler(CommandHandler("shell", shell_request_cmd))
+    app.add_handler(CommandHandler("py", py_request_cmd))
+    # messages
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return app
+
+def heartbeat_worker():
+    while True:
+        write_heartbeat()
+        time.sleep(30)
+
+# ---------- main ----------
+def main():
+    global GLOBAL_APP
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
+    if BACKEND=="openai" and not OPENAI_KEYS:
+        logger.warning("OpenAI backend selected but no OPENAI_API_KEY(S) provided.")
+
+    app=build_app(); GLOBAL_APP=app
+
+    # background threads
+    threading.Thread(target=start_health, daemon=True).start()
+    threading.Thread(target=learning_worker, daemon=True).start()
+    threading.Thread(target=watch_logs, daemon=True).start()
+    threading.Thread(target=heartbeat_worker, daemon=True).start()
+
+    logger.info("🚀 Alex mega bot starting…"); app.run_polling(close_loop=False)
+
+if __name__=="__main__":
+    main()
+
+# =========================
+# Quick env checklist:
+# TELEGRAM_TOKEN=<bot token>
+# OWNER_ID=<your telegram numeric id>
+# BACKEND=openai|ollama
+#   OPENAI_API_KEYS=key1,key2,...   (or OPENAI_API_KEY=single)
+#   OPENAI_MODEL=gpt-4o-mini
+#   OLLAMA_HOST=http://localhost:11434
+#   OLLAMA_MODEL=llama3.1:8b-instruct
+# SERPAPI_KEY=<optional>
+# HUMANE_TONE=1
+# SHORTCUT_SECRET=<something-long>  (for /shortcut endpoint)
+# USE_OPENAI_STT=0|1, USE_OPENAI_TTS=0|1, OPENAI_TTS_VOICE=alloy
+# PORT=8080
+# =========================
