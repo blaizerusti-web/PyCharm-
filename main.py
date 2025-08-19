@@ -20,7 +20,27 @@ except ImportError:
     print("⚠️ SpeechRecognition not installed. Jarvis voice disabled.")
 
 # Optional: for TTS/STT + wake word Jarvis mode
-import speech_recognition as sr
+# --- optional speech recognition (Jarvis voice) ---
+# Replace any bare `import speech_recognition as sr` with the safe block below.
+
+try:
+    # try to ensure package (your _ensure function exists earlier in file)
+    # If you don't have _ensure defined above imports, you can pip install manually instead.
+    _ensure("speech_recognition", "SpeechRecognition")
+    import speech_recognition as sr
+    HAS_SPEECH = True
+    try:
+        recognizer = sr.Recognizer()
+    except Exception as _e:
+        recognizer = None
+        HAS_SPEECH = False
+        logging.warning("SpeechRecognition imported but recognizer init failed: %s — Jarvis voice disabled.", _e)
+    logging.info("SpeechRecognition available — Jarvis voice enabled (if runtime supports audio).")
+except Exception as e:
+    sr = None
+    recognizer = None
+    HAS_SPEECH = False
+    logging.warning("SpeechRecognition not installed or import failed: %s. Jarvis voice disabled.", e)
 import pyttsx3
 
 # =========================
