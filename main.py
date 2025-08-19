@@ -9,6 +9,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict, Any, List, Tuple
 
+# --- Port fix helper ---
+def _find_free_port(start=8080, max_tries=50):
+    import socket
+    for p in range(start, start+max_tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('0.0.0.0', p))
+                return p
+            except OSError:
+                continue
+    raise RuntimeError('No free port found')
+
+
 # ---------- bootstrap: install/import ----------
 def _ensure(import_name: str, pip_name: str | None = None):
     try:
