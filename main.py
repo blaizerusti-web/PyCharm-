@@ -890,15 +890,31 @@ class Health(BaseHTTPRequestHandler):
         return self._ok(b"not found", 404)
         class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
 
-if __name__ == "__main__":
+def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"Health check server running on port {PORT}")
+    print(f"✅ Health check server running on port {PORT}")
     server.serve_forever()
+
+# Start health check server in background
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
+
+# Keep main thread alive
+if __name__ == "__main__":
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("🛑 Shutting down.")
 
 # ---------- Backend / Jarvis / Guardrails control commands ----------
 async def backend_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
