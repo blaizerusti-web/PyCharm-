@@ -269,12 +269,12 @@ DB_PATH="alex_memory.db"
 conn=sqlite3.connect(DB_PATH, check_same_thread=False)
 cur=conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS raw_events(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, type TEXT NOT NULL, text TEXT NOT NULL, meta TEXT)""")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_events(ts)")
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, type TEXT NOT NULL, text TEXT NOT NULL, meta TEXT)""" )
+cur.execute("""CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_events(ts)""" )
 cur.execute("""CREATE TABLE IF NOT EXISTS notes(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, source TEXT NOT NULL, topic_key TEXT NOT NULL,
-  title TEXT, content TEXT NOT NULL, tags TEXT, sentiment TEXT, raw_ref TEXT)""")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)")
+  title TEXT, content TEXT NOT NULL, tags TEXT, sentiment TEXT, raw_ref TEXT)""" )
+cur.execute("""CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)""" )
 conn.commit()
 
 RAW_JSONL=Path("raw_events.jsonl")
@@ -332,12 +332,12 @@ def remember(source:str, text:str, raw_ref:str="")->int:
     if row:
         nid, existing=row
         merged=_merge_contents(existing, digest["summary"])
-        cur.execute("""UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=?,raw_ref=? WHERE id=?""",
+        cur.execute("""UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=?,raw_ref=? WHERE id=?""" ,
                     (datetime.utcnow().isoformat(),source,digest["title"],merged,digest["tags"],digest["sentiment"],raw_ref,nid))
         conn.commit()
         return nid
     cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                   VALUES(?,?,?,?,?,?,?,?)""" ,
                 (datetime.utcnow().isoformat(),source,topic,digest["title"],digest["summary"],digest["tags"],digest["sentiment"],raw_ref))
     conn.commit()
     return cur.lastrowid
@@ -822,7 +822,7 @@ def learning_worker():
                                 (datetime.utcnow().isoformat(),"system","Persona",persona,"persona,profile","",row[0]))
                 else:
                     cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
-                                   VALUES(?,?,?,?,?,?,?,?)""",
+                                   VALUES(?,?,?,?,?,?,?,?)""" ,
                                 (datetime.utcnow().isoformat(),"system",tk,"Persona",persona,"persona,profile","",""))
                 conn.commit()
         except Exception as e:
