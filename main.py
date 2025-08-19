@@ -1,56 +1,86 @@
 # =========================
-# mega.py — Alex (OpenAI key-rotation or Ollama; Telegram; Memory; RAG; Shortcuts webhook; Jarvis)
+# mega.py — Alex (Hybrid auto: Ollama via tunnel + OpenAI fallback; Telegram; Memory; RAG; Jarvis; Shortcuts webhook)
 # =========================
 
-import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile, random, uuid, base64
+import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile, random, uuid
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
-from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse, parse_qs
+from typing import Optional, Dict, Any, List, Tuple
 
 # ---------- bootstrap: install/import ----------
 def _ensure(import_name: str, pip_name: str | None = None):
     try:
         return __import__(import_name)
     except ModuleNotFoundError:
+        import subprocess
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name or import_name])
         return __import__(import_name)
 
-requests=_ensure("requests"); aiohttp=_ensure("aiohttp")
-_ensure("bs4","beautifulsoup4"); _ensure("pandas"); _ensure("openpyxl"); _ensure("PIL","Pillow")
-t_ext=_ensure("telegram.ext","python-telegram-bot==20.*"); telegram=_ensure("telegram")
+requests=_ensure("requests")
+aiohttp=_ensure("aiohttp")
+_ensure("bs4","beautifulsoup4")
+_ensure("pandas")
+_ensure("openpyxl")
+_ensure("PIL","Pillow")
+t_ext=_ensure("telegram.ext","python-telegram-bot==20.*")
+telegram=_ensure("telegram")
 
-try: _ensure("pytesseract"); HAS_TESS=True
-except Exception: HAS_TESS=False
+try:
+    _ensure("pytesseract")
+    HAS_TESS=True
+except Exception:
+    HAS_TESS=False
 
 from PIL import Image, ExifTags
 from bs4 import BeautifulSoup
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import pandas as pd
 
 # ---------- config / logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger=logging.getLogger("mega")
 
+# Telegram & owner
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN","").strip()
 OWNER_ID=os.getenv("OWNER_ID","").strip()   # your Telegram numeric user id
-PORT=int(os.getenv("PORT","8080"))
-SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
-HUMANE_TONE=os.getenv("HUMANE_TONE","1")=="1"
 
-# AI backend
-BACKEND=os.getenv("BACKEND","openai").strip().lower()
+# Server / ports
+PORT=int(os.getenv("PORT","8080"))
+
+# Third-party APIs
+SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
+
+# Personality toggles
+HUMANE_TONE=os.getenv("HUMANE_TONE","1")=="1"
+JARVIS_MODE_DEFAULT=os.getenv("JARVIS_MODE","0")=="1"     # can be toggled at runtime
+DEV_MODE_DEFAULT=os.getenv("DEV_MODE","0")=="1"           # looser tone, still safe; owner can toggle
+
+# Backend selection
+#   auto   => try Ollama (tunnel / remote) first, fallback to OpenAI
+#   openai => force OpenAI
+#   ollama => force Ollama (if unavailable, graceful error)
+BACKEND_MODE_DEFAULT=os.getenv("BACKEND","auto").strip().lower()
 OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-4o-mini").strip()
+
+# OpenAI keys (rotation)
 OPENAI_KEYS=[k.strip() for k in os.getenv("OPENAI_API_KEYS","").split(",") if k.strip()]
 if not OPENAI_KEYS and os.getenv("OPENAI_API_KEY","").strip():
     OPENAI_KEYS=[os.getenv("OPENAI_API_KEY","").strip()]
 
-OLLAMA_HOST=os.getenv("OLLAMA_HOST","http://localhost:11434").strip().rstrip("/")
+# Ollama hybrid (Option 2)
+# List of candidate endpoints; first healthy is used.
+# Examples:
+#   OLLAMA_URLS="https://abc-123.ngrok.app,http://100.100.100.10:11434,http://localhost:11434"
+OLLAMA_URLS=[u.strip().rstrip("/") for u in os.getenv("OLLAMA_URLS","").split(",") if u.strip()]
+# Back-compat:
+if not OLLAMA_URLS:
+    host=os.getenv("OLLAMA_HOST","http://localhost:11434").strip().rstrip("/")
+    if host: OLLAMA_URLS=[host]
 OLLAMA_MODEL=os.getenv("OLLAMA_MODEL","llama3.1:8b-instruct").strip()
 
-# iOS Shortcuts webhook secret (required for /shortcut)
+# iOS Shortcuts webhook
 SHORTCUT_SECRET=os.getenv("SHORTCUT_SECRET","").strip()
 
 # Optional STT/TTS flags (OpenAI only)
@@ -58,24 +88,28 @@ USE_OPENAI_STT=os.getenv("USE_OPENAI_STT","0")=="1"
 USE_OPENAI_TTS=os.getenv("USE_OPENAI_TTS","0")=="1"
 OPENAI_TTS_VOICE=os.getenv("OPENAI_TTS_VOICE","alloy")
 
-if not TELEGRAM_TOKEN: logger.warning("TELEGRAM_TOKEN not set (required).")
-logger.info("Backend: %s | OpenAI model=%s (keys=%d) | Ollama=%s @ %s",
-             BACKEND, OPENAI_MODEL, len(OPENAI_KEYS), OLLAMA_MODEL, OLLAMA_HOST)
-logger.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available")
+logging.info("Backend mode: %s | OpenAI model=%s (keys=%d)", BACKEND_MODE_DEFAULT, OPENAI_MODEL, len(OPENAI_KEYS))
+logging.info("Ollama candidates: %s | model=%s", OLLAMA_URLS, OLLAMA_MODEL)
+logging.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available")
 
 START_TIME=time.time()
 SAVE_DIR=Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
 
-# Heartbeat file
-HEARTBEAT=Path("heartbeat.txt")
-
-# ---------- AI backend (OpenAI rotation/backoff OR Ollama) ----------
+# ---------- AI backend (Hybrid: Ollama candidate list + OpenAI rotation/backoff) ----------
 class AIBackend:
-    def __init__(self, backend:str):
-        self.backend=backend
+    def __init__(self, backend_mode:str, ollama_urls:List[str], ollama_model:str, openai_model:str):
+        self.backend_mode=backend_mode
+        self._ollama_urls=list(dict.fromkeys([u for u in ollama_urls if u]))  # de-dup, preserve order
+        self.ollama_model=ollama_model
+        self.openai_model=openai_model
         self._key_idx=0
         self._session = requests.Session()
-        if backend=="openai":
+        self._ollama_health: Dict[str, Tuple[bool, float]] = {}  # url -> (healthy, ts_epoch)
+
+        # OpenAI SDKs
+        self._new_sdk_cls=None
+        self._old_sdk=None
+        if OPENAI_KEYS:
             try:
                 from openai import OpenAI as _New
                 self._new_sdk_cls=_New
@@ -87,94 +121,182 @@ class AIBackend:
             except Exception:
                 self._old_sdk=None
 
+    # ----- dynamic controls -----
+    def set_backend_mode(self, mode:str):
+        self.backend_mode=mode.strip().lower()
+
+    def add_ollama_url(self, url:str):
+        url=url.strip().rstrip("/")
+        if url and url not in self._ollama_urls:
+            self._ollama_urls.insert(0, url)  # prefer newly added
+            logging.info("Added Ollama URL: %s", url)
+
+    def list_ollama_urls(self)->List[str]:
+        return list(self._ollama_urls)
+
+    def remove_ollama_url(self, url:str):
+        url=url.strip().rstrip("/")
+        self._ollama_urls=[u for u in self._ollama_urls if u!=url]
+
+    # ----- openai key rotation -----
     def _pick_key(self)->Optional[str]:
         if not OPENAI_KEYS: return None
         k=OPENAI_KEYS[self._key_idx % len(OPENAI_KEYS)]
         self._key_idx=(self._key_idx+1) % max(1,len(OPENAI_KEYS))
         return k
 
-    def chat(self, messages:List[Dict[str,Any]], model:str=None, max_tokens:int=800, timeout:float=60.0)->str:
-        model=model or (OPENAI_MODEL if self.backend=="openai" else OLLAMA_MODEL)
-        if self.backend=="ollama":
-            try:
-                payload={"model":model,"messages":messages,"stream":False}
-                r=self._session.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
-                r.raise_for_status(); j=r.json()
-                if "message" in j and "content" in j["message"]: return (j["message"]["content"] or "").strip()
-                if "response" in j: return (j["response"] or "").strip()
-                return "⚠️ Ollama: unexpected response."
-            except Exception as e:
-                logger.exception("Ollama chat error"); return f"⚠️ Ollama error: {e}"
+    # ----- ollama health & selection -----
+    def _check_ollama(self, url:str, ttl:float=25.0)->bool:
+        now=time.time()
+        healthy, ts = self._ollama_health.get(url,(False,0.0))
+        if now - ts < 15:   # cache for 15s
+            return healthy
+        try:
+            r=self._session.get(f"{url}/api/version", timeout=ttl)
+            ok = (r.status_code==200)
+        except Exception:
+            ok=False
+        self._ollama_health[url]=(ok, now)
+        return ok
 
-        # OpenAI path
+    def _select_ollama(self)->Optional[str]:
+        for u in self._ollama_urls:
+            if self._check_ollama(u):
+                return u
+        return None
+
+    # ----- chat paths -----
+    def _ollama_chat(self, messages:List[Dict[str,Any]], model:str|None, timeout:float=60.0)->str:
+        url=self._select_ollama()
+        if not url:
+            raise RuntimeError("No healthy Ollama endpoints available.")
+        payload={"model": model or self.ollama_model, "messages":messages, "stream":False}
+        r=self._session.post(f"{url}/api/chat", json=payload, timeout=timeout)
+        r.raise_for_status()
+        j=r.json()
+        if isinstance(j, dict):
+            if "message" in j and isinstance(j["message"], dict):
+                return (j["message"].get("content","") or "").strip()
+            if "response" in j:
+                return (j["response"] or "").strip()
+        return "⚠️ Ollama: unexpected response."
+
+    def _openai_chat(self, messages:List[Dict[str,Any]], model:str|None, max_tokens:int=800, timeout:float=60.0)->str:
         if not OPENAI_KEYS: return "⚠️ OPENAI_API_KEY(S) not set."
-        attempts=max(3, len(OPENAI_KEYS)); base_sleep=1.2
+        attempts=max(3, len(OPENAI_KEYS)); base_sleep=1.1
+        last_error=None
         for i in range(attempts):
             key=self._pick_key()
             try:
                 if self._new_sdk_cls:
                     cli=self._new_sdk_cls(api_key=key)
-                    r=cli.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
-                    return (r.choices[0].message.content or "").strip()
+                    r=cli.chat.completions.create(model=model or self.openai_model, messages=messages, max_tokens=max_tokens)
+                    return r.choices[0].message.content.strip()
                 elif self._old_sdk:
                     self._old_sdk.api_key=key
-                    r=self._old_sdk.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens, request_timeout=timeout)
-                    return (r["choices"][0]["message"]["content"] or "").strip()
+                    r=self._old_sdk.ChatCompletion.create(model=model or self.openai_model, messages=messages, max_tokens=max_tokens, request_timeout=timeout)
+                    return r["choices"][0]["message"]["content"].strip()
                 else:
                     return "⚠️ OpenAI SDK not available."
             except Exception as e:
+                last_error=e
                 msg=str(e).lower()
                 retriable=any(t in msg for t in ["rate limit","quota","429","timeout","temporarily","connection","service unavailable"])
-                logger.warning("OpenAI attempt %d/%d failed: %s", i+1, attempts, e)
+                logging.warning("OpenAI attempt %d/%d failed: %s", i+1, attempts, e)
                 if i<attempts-1 and retriable:
-                    time.sleep(base_sleep*(2**i)+random.random()*0.5)
+                    time.sleep(base_sleep*(2**i)+random.random()*0.4)
                     continue
-                return f"⚠️ OpenAI error: {e}"
-        return "⚠️ OpenAI: all attempts failed."
+                break
+        return f"⚠️ OpenAI error: {last_error}"
 
-AI=AIBackend(BACKEND)
+    def chat(self, messages:List[Dict[str,Any]], model:str|None=None, max_tokens:int=800, timeout:float=60.0)->str:
+        mode=self.backend_mode
+        if mode=="ollama":
+            try:
+                return self._ollama_chat(messages, model, timeout=timeout)
+            except Exception as e:
+                logging.error("Ollama error: %s", e)
+                return f"⚠️ Ollama error: {e}"
+        elif mode=="openai":
+            return self._openai_chat(messages, model, max_tokens=max_tokens, timeout=timeout)
+        else:  # auto (hybrid)
+            try:
+                return self._ollama_chat(messages, model, timeout=timeout)
+            except Exception as e:
+                logging.info("Ollama unavailable, falling back to OpenAI: %s", e)
+                return self._openai_chat(messages, model, max_tokens=max_tokens, timeout=timeout)
+
+# Global backend instance (runtime-mutable)
+AI=AIBackend(BACKEND_MODE_DEFAULT, OLLAMA_URLS, OLLAMA_MODEL, OPENAI_MODEL)
+
+# ---------- Persona / runtime state ----------
+GLOBAL_APP:Application|None=None
+STATE={
+    "jarvis_mode": JARVIS_MODE_DEFAULT,
+    "dev_mode": DEV_MODE_DEFAULT,
+    "backend_mode": BACKEND_MODE_DEFAULT,            # mirrors AI.backend_mode
+    "force_ollama_url": "",                          # optional: pin to one URL
+}
+MEM_RUNTIME={"log_path":"", "subscribers": []}
+
+def _owner_only(update:Update)->bool:
+    return OWNER_ID and str(update.effective_user.id)==str(OWNER_ID)
+
+def persona_prompt()->str:
+    base = "You are Alex — concise, helpful, witty, and practical."
+    if STATE["jarvis_mode"]:
+        base = ("You are Alex (aka Jarvis) — proactive, succinct, voice-friendly. "
+                "Offer smart defaults, anticipate needs, and keep answers tight.")
+    if STATE["dev_mode"]:
+        base += " Be direct and unblocked, but stay safe and lawful."
+    if HUMANE_TONE:
+        base += " Prefer short sentences and humane summaries."
+    return base
 
 async def ask_ai(prompt:str, context:str="")->str:
-    return AI.chat([{"role":"system","content":context or "You are Alex — concise, helpful, a little witty."},
-                    {"role":"user","content":prompt}], max_tokens=800)
-
-# Jarvis: alternate persona (command /jarvis)
-async def ask_jarvis(prompt:str)->str:
-    ctx=("You are Jarvis — proactive, witty, and decisive. Prefer bullet action steps, keep answers crisp. "
-         "If code is needed, show only essentials. Assume power-user context.")
-    return AI.chat([{"role":"system","content":ctx},{"role":"user","content":prompt}], max_tokens=800)
-
-# Heartbeat writer
-def write_heartbeat():
+    sysmsg=context or persona_prompt()
     try:
-        HEARTBEAT.write_text(f"alive {datetime.utcnow().isoformat()}Z | backend={BACKEND}\n", encoding="utf-8")
+        return AI.chat(
+            [{"role":"system","content":sysmsg},
+             {"role":"user","content":prompt}],
+            max_tokens=800
+        )
     except Exception as e:
-        logger.debug(f"Heartbeat write failed: {e}")
+        logging.exception("ask_ai error")
+        return f"⚠️ AI error: {e}"
         # ---------- SQLite memory ----------
-DB_PATH="alex_memory.db"; conn=sqlite3.connect(DB_PATH, check_same_thread=False); cur=conn.cursor()
+DB_PATH="alex_memory.db"
+conn=sqlite3.connect(DB_PATH, check_same_thread=False)
+cur=conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS raw_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, type TEXT NOT NULL, text TEXT NOT NULL, meta TEXT)""")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_events(ts)")
 cur.execute("""CREATE TABLE IF NOT EXISTS notes(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, source TEXT NOT NULL, topic_key TEXT NOT NULL,
   title TEXT, content TEXT NOT NULL, tags TEXT, sentiment TEXT, raw_ref TEXT)""")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)"); conn.commit()
+cur.execute("CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)")
+conn.commit()
 
 RAW_JSONL=Path("raw_events.jsonl")
 def _append_jsonl(obj:dict):
     try:
         with RAW_JSONL.open("a", encoding="utf-8") as f: f.write(json.dumps(obj, ensure_ascii=False)+"\n")
-    except Exception as e: logger.error("JSONL append error: %s", e)
+    except Exception as e: logging.error("JSONL append error: %s", e)
 
 def log_raw(ev_type:str, text:str, meta:dict|None=None)->int:
-    ts=datetime.utcnow().isoformat(); m=json.dumps(meta or {}, ensure_ascii=False)
-    cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m)); conn.commit()
-    rid=cur.lastrowid; _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
-    logger.info("raw[%s] %s: %s", rid, ev_type, (text[:200]+"…") if len(text)>200 else text); return rid
+    ts=datetime.utcnow().isoformat()
+    m=json.dumps(meta or {}, ensure_ascii=False)
+    cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m))
+    conn.commit()
+    rid=cur.lastrowid
+    _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
+    logging.info("raw[%s] %s: %s", rid, ev_type, (text[:200]+"…") if len(text)>200 else text)
+    return rid
 
 # summarization + topic merge
 def _topic_key(text:str)->str:
-    seed=re.sub(r"[^a-z0-9 ]+"," ",re.sub(r"https?://\S+","",text.lower())); seed=" ".join(seed.split()[:12])
+    seed=re.sub(r"[^a-z0-9 ]+"," ",re.sub(r"https?://\S+","",text.lower()))
+    seed=" ".join(seed.split()[:12])
     return hashlib.sha1(seed.encode()).hexdigest()
 
 def _merge_contents(old:str, new:str)->str:
@@ -195,23 +317,30 @@ def _humane_summarize(text:str, capture_tone:bool=True)->dict:
         out=AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=360)
         try: data=json.loads(out)
         except Exception: data={"title":"","summary":out.strip(),"tags":"","sentiment":""}
-        return {"title":(data.get("title") or "")[:120],"summary":(data.get("summary") or out).strip(),
-                "tags":(data.get("tags") or "").replace("\n"," ").strip(),"sentiment":(data.get("sentiment") or "").strip()}
+        return {"title":(data.get("title") or "")[:120],
+                "summary":(data.get("summary") or out).strip(),
+                "tags":(data.get("tags") or "").replace("\n"," ").strip(),
+                "sentiment":(data.get("sentiment") or "").strip()}
     except Exception:
         return {"title":"","summary":text[:900],"tags":"","sentiment":""}
 
 def remember(source:str, text:str, raw_ref:str="")->int:
-    digest=_humane_summarize(text, True); topic=_topic_key(digest["summary"] or text)
-    cur.execute("SELECT id, content FROM notes WHERE topic_key=? ORDER BY id DESC LIMIT 1",(topic,)); row=cur.fetchone()
+    digest=_humane_summarize(text, True)
+    topic=_topic_key(digest["summary"] or text)
+    cur.execute("SELECT id, content FROM notes WHERE topic_key=? ORDER BY id DESC LIMIT 1",(topic,))
+    row=cur.fetchone()
     if row:
-        nid, existing=row; merged=_merge_contents(existing, digest["summary"])
+        nid, existing=row
+        merged=_merge_contents(existing, digest["summary"])
         cur.execute("""UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=?,raw_ref=? WHERE id=?""",
                     (datetime.utcnow().isoformat(),source,digest["title"],merged,digest["tags"],digest["sentiment"],raw_ref,nid))
-        conn.commit(); return nid
+        conn.commit()
+        return nid
     cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (datetime.utcnow().isoformat(),source,topic,digest["title"],digest["summary"],digest["tags"],digest["sentiment"],raw_ref))
-    conn.commit(); return cur.lastrowid
+    conn.commit()
+    return cur.lastrowid
 
 # ---------- simple lexical search ----------
 _WORD_RE=re.compile(r"[a-z0-9]+")
@@ -259,7 +388,8 @@ def build_context_blurb(found:dict, max_chars:int=3800)->str:
     return "\n\n".join(parts)[:max_chars]
 
 async def rag_answer(question:str)->str:
-    found=search_memory(question,k_raw=10,k_notes=10); ctx=build_context_blurb(found)
+    found=search_memory(question,k_raw=10,k_notes=10)
+    ctx=build_context_blurb(found)
     prompt=f"""Use the CONTEXT to answer the QUESTION.
 - Be concise and actionable; cite ids like (NOTE #12) or (RAW #99).
 - If conflicts, state best-supported view & mention uncertainty.
@@ -288,7 +418,7 @@ async def fetch_url(url:str)->str:
         snippet=soup.get_text(" ")[:1800]
         return f"🌐 {title}\nDesc: {desc[:200]}\nH1: {h1}\nWords:{words} Links:{links} Images:{images}\n\nSnippet:\n{snippet}"
     except Exception as e:
-        logger.exception("Crawl error"); return f"⚠️ Crawl error: {e}"
+        logging.exception("Crawl error"); return f"⚠️ Crawl error: {e}"
 
 async def analyze_url(url:str)->str:
     content=await fetch_url(url)
@@ -299,37 +429,46 @@ async def analyze_url(url:str)->str:
 # ---------- File analyzers ----------
 def analyze_excel(path:Path)->str:
     try:
-        df=pd.read_excel(path); head=", ".join(map(str,list(df.columns)[:12]))
+        df=pd.read_excel(path)
+        head=", ".join(map(str,list(df.columns)[:12]))
         info=f"✅ Excel loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head}"
         num=df.select_dtypes(include="number")
         if not num.empty: info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
         log_raw("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file":str(path)})
         remember("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
         return info
-    except Exception as e: logger.exception("Excel analysis error"); return f"⚠️ Excel analysis error: {e}"
+    except Exception as e:
+        logging.exception("Excel analysis error"); return f"⚠️ Excel analysis error: {e}"
 
 def analyze_csv(path:Path)->str:
     try:
-        df=pd.read_csv(path, nrows=50000); head=", ".join(map(str,list(df.columns)[:12]))
+        df=pd.read_csv(path, nrows=50000)
+        head=", ".join(map(str,list(df.columns)[:12]))
         info=f"✅ CSV loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head}"
         num=df.select_dtypes(include="number")
         if not num.empty: info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
         log_raw("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file":str(path)})
         remember("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
         return info
-    except Exception as e: logger.exception("CSV analysis error"); return f"⚠️ CSV analysis error: {e}"
+    except Exception as e:
+        logging.exception("CSV analysis error"); return f"⚠️ CSV analysis error: {e}"
 
 def analyze_json(path:Path)->str:
     try:
-        raw=path.read_text(encoding="utf-8", errors="ignore"); data=json.loads(raw)
-        if isinstance(data,list): shape=f"list[{len(data)}]"; preview=json.dumps(data[:3], ensure_ascii=False)[:1500]
-        elif isinstance(data,dict): shape=f"dict({len(data.keys())} keys)"; preview=json.dumps({k:data[k] for k in list(data.keys())[:10]}, ensure_ascii=False)[:1500]
-        else: shape=type(data).__name__; preview=str(data)[:1500]
+        raw=path.read_text(encoding="utf-8", errors="ignore")
+        data=json.loads(raw)
+        if isinstance(data,list):
+            shape=f"list[{len(data)}]"; preview=json.dumps(data[:3], ensure_ascii=False)[:1500]
+        elif isinstance(data,dict):
+            shape=f"dict({len(data.keys())} keys)"; preview=json.dumps({k:data[k] for k in list(data.keys())[:10]}, ensure_ascii=False)[:1500]
+        else:
+            shape=type(data).__name__; preview=str(data)[:1500]
         info=f"✅ JSON loaded: {shape}\nPreview: {preview}"
         log_raw("file", f"JSON {path.name}: shape {shape}", {"file":str(path)})
         remember("file", f"JSON {path.name}: shape {shape}\nPreview: {preview}", raw_ref=str(path))
         return info
-    except Exception as e: logger.exception("JSON analysis error"); return f"⚠️ JSON analysis error: {e}"
+    except Exception as e:
+        logging.exception("JSON analysis error"); return f"⚠️ JSON analysis error: {e}"
 
 # ---------- Image analyzer (EXIF + optional OCR) ----------
 def _exif_dict(im:Image.Image)->dict:
@@ -348,35 +487,43 @@ def analyze_image(path:Path)->str:
         im=Image.open(path); exif=_exif_dict(im); meta["exif"]=exif
         if HAS_TESS:
             try:
-                import pytesseract; ocr=pytesseract.image_to_string(im) or ""
-            except Exception as e: ocr=f"(OCR unavailable: {e})"
-        else: ocr="(OCR module not installed)"
+                import pytesseract
+                ocr=pytesseract.image_to_string(im) or ""
+            except Exception as e:
+                ocr=f"(OCR unavailable: {e})"
+        else:
+            ocr="(OCR module not installed)"
         rid=log_raw("image", ocr if ocr else "(no OCR text)", meta)
         gist=f"Image {path.name}: EXIF {exif if exif else '∅'}; OCR preview: {(ocr[:500]+'…') if ocr and len(ocr)>500 else (ocr or '∅')}"
         remember("image", gist, raw_ref=str(path))
         return f"🖼️ Image saved. EXIF keys: {list(exif.keys()) if exif else 'none'}. OCR length: {len(ocr)} chars. (raw id {rid})"
     except Exception as e:
         log_raw("image", f"Image load error {path.name}: {e}", {"file": str(path)})
-        logger.exception("Image analysis error"); return f"⚠️ Image analysis error: {e}"
+        logging.exception("Image analysis error"); return f"⚠️ Image analysis error: {e}"
+
+# ---------- SERP (optional) ----------
+def serp_search_snippet(query:str)->str:
+    if not SERPAPI_KEY: return "⚠️ SERPAPI_KEY not set."
+    try:
+        r=requests.get("https://serpapi.com/search", params={"q":query,"hl":"en","api_key":SERPAPI_KEY}, timeout=25)
+        j=r.json()
+        snip=j.get("organic_results",[{}])[0].get("snippet","(no results)")
+        return f"🔎 {query}\n{snip}"
+    except Exception as e:
+        logging.exception("Search error"); return f"Search error: {e}"
         # ---------- Telegram handlers ----------
-GLOBAL_APP:Application|None=None
-MEM_RUNTIME={"log_path":"", "subscribers": []}
-
-# ----- Approval queue for dangerous ops -----
-PENDING_CMDS: Dict[str, Dict[str,Any]] = {}  # id -> {type:'shell'|'py', 'cmd'|'code', 'chat_id'}
-
-def _owner_only(update:Update)->bool:
-    return OWNER_ID and str(update.effective_user.id)==str(OWNER_ID)
-
 async def start_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hey, I'm Alex 🤖\n"
-        "Core: /ai <prompt>, /jarvis <prompt>, /ask <question>\n"
+        "Hey, I'm Alex 🤖 (hybrid brain: Ollama→OpenAI fallback)\n"
+        "Core: /ai <prompt>, /ask <question>, prefix 'jarvis:' for Jarvis mode\n"
         "Ingest: /analyze <url>, send images & .xlsx/.csv/.json files\n"
         "Memory: /remember <text>, /mem [n], /exportmem, /raw [n]\n"
         "Logs: /setlog <path>, /subscribe_logs, /unsubscribe_logs, /logs [n]\n"
-        "Utils: /search <query>, /id, /uptime, /backup, /config\n"
-        "Dangerous ops require owner approval: /queue, /approve <id>, /deny <id>, /shell <cmd>, /py <code>"
+        "Search: /search <query>\n"
+        "Voice: /speak <text> (TTS, if enabled)\n"
+        "Backend: /backend <auto|openai|ollama>, /ollama_list, /ollama_add <url>, /ollama_status\n"
+        "Dangerous ops (owner approval): /queue, /approve <id>, /deny <id>, /shell <cmd>, /py <code>\n"
+        "Jarvis: /jarvis_on, /jarvis_off | Guardrails: /trust_on, /trust_off"
     )
 
 async def id_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -387,9 +534,10 @@ async def uptime_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
 
 async def config_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    flags={"BACKEND":BACKEND,"OPENAI_MODEL":OPENAI_MODEL,"OLLAMA_MODEL":OLLAMA_MODEL,"HUMANE_TONE":HUMANE_TONE,
+    flags={"BACKEND_MODE":STATE["backend_mode"],"OPENAI_MODEL":OPENAI_MODEL,"OLLAMA_MODEL":OLLAMA_MODEL,"HUMANE_TONE":HUMANE_TONE,
            "HAS_TESS":HAS_TESS,"SERPAPI_KEY_set":bool(SERPAPI_KEY),"DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),
-           "PORT":PORT,"USE_OPENAI_STT":USE_OPENAI_STT,"USE_OPENAI_TTS":USE_OPENAI_TTS,"HEARTBEAT":str(HEARTBEAT)}
+           "PORT":PORT,"USE_OPENAI_STT":USE_OPENAI_STT,"USE_OPENAI_TTS":USE_OPENAI_TTS,
+           "JARVIS_MODE":STATE["jarvis_mode"],"DEV_MODE":STATE["dev_mode"],"OLLAMA_URLS":AI.list_ollama_urls()}
     await update.message.reply_text("Config:\n"+json.dumps(flags, indent=2))
 
 async def backup_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -401,52 +549,60 @@ async def backup_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
             manifest={"files":[str(p) for p in SAVE_DIR.glob("*") if p.is_file()]}
             man_path=Path("received_manifest.json"); man_path.write_text(json.dumps(manifest, indent=2)); z.write(man_path)
         await update.message.reply_document(document=str(zpath), filename=zpath.name)
-    except Exception as e: logger.exception("Backup error"); await update.message.reply_text(f"Backup error: {e}")
+    except Exception as e:
+        logging.exception("Backup error"); await update.message.reply_text(f"Backup error: {e}")
+
+# ---- App logic helpers ----
+def _maybe_jarvis_text(text:str)->Tuple[bool,str]:
+    t=text.strip()
+    lowered=t.lower()
+    if lowered.startswith("jarvis:") or lowered.startswith("jarvis,"):
+        return True, t.split(":",1)[1].strip() if ":" in t else t.split(",",1)[1].strip()
+    return False, t
 
 async def ai_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=" ".join(ctx.args)
     if not q: return await update.message.reply_text("Usage: /ai <your prompt>")
-    ans=await ask_ai(q)
-    log_raw("chat_user", q, {"chat_id":update.effective_chat.id}); log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
-    remember("chat", f"Q: {q}\nA gist: {ans[:400]}"); await update.message.reply_text(ans)
-
-async def jarvis_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    q=" ".join(ctx.args)
-    if not q: return await update.message.reply_text("Usage: /jarvis <your prompt>")
-    ans=await ask_jarvis(q)
-    log_raw("chat_user", f"/jarvis {q}", {"chat_id":update.effective_chat.id})
-    log_raw("chat_jarvis", ans, {"chat_id":update.effective_chat.id})
-    remember("jarvis", f"Q: {q}\nA gist: {ans[:400]}"); await update.message.reply_text(ans)
+    is_jarvis, q2=_maybe_jarvis_text(q)
+    # temporary persona override if "jarvis:" prefix used
+    persona = persona_prompt() if not is_jarvis else ("You are Alex (Jarvis) — voice-friendly, decisive, short.")
+    ans=AI.chat([{"role":"system","content":persona},{"role":"user","content":q2}], max_tokens=800)
+    log_raw("chat_user", q, {"chat_id":update.effective_chat.id})
+    log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
+    remember("chat", f"Q: {q}\nA gist: {ans[:400]}")
+    await update.message.reply_text(ans)
 
 async def ask_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=" ".join(ctx.args).strip()
     if not q: return await update.message.reply_text("Usage: /ask <question about anything I've seen/learned>")
     log_raw("chat_user", f"/ask {q}", {"chat_id":update.effective_chat.id})
-    ans=await rag_answer(q); log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id}); await update.message.reply_text(ans)
+    ans=await rag_answer(q)
+    log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
+    await update.message.reply_text(ans)
 
 async def search_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not ctx.args: return await update.message.reply_text("Usage: /search <query>")
-    if not SERPAPI_KEY: return await update.message.reply_text("⚠️ SERPAPI_KEY not set.")
     query=" ".join(ctx.args)
-    try:
-        r=requests.get("https://serpapi.com/search", params={"q":query,"hl":"en","api_key":SERPAPI_KEY}, timeout=25)
-        j=r.json(); snip=j.get("organic_results",[{}])[0].get("snippet","(no results)")
-        out=f"🔎 {query}\n{snip}"
-        log_raw("chat_user", f"/search {query}", {"chat_id":update.effective_chat.id})
-        log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); remember("chat", f"SERP for '{query}': {snip}")
-        await update.message.reply_text(out)
-    except Exception as e: logger.exception("Search error"); await update.message.reply_text(f"Search error: {e}")
+    out=serp_search_snippet(query)
+    log_raw("chat_user", f"/search {query}", {"chat_id":update.effective_chat.id})
+    log_raw("chat_alex", out, {"chat_id":update.effective_chat.id})
+    if out.startswith("🔎"):
+        remember("chat", f"SERP for '{query}': {out.splitlines()[-1]}")
+    await update.message.reply_text(out)
 
 async def analyze_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not ctx.args: return await update.message.reply_text("Usage: /analyze <url>")
-    url=ctx.args[0]; await update.message.reply_text("🔍 Crawling and summarizing…")
-    res=await analyze_url(url); await update.message.reply_text(res)
+    url=ctx.args[0]
+    await update.message.reply_text("🔍 Crawling and summarizing…")
+    res=await analyze_url(url)
+    await update.message.reply_text(res)
 
 async def remember_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     text=" ".join(ctx.args).strip()
     if not text: return await update.message.reply_text("Usage: /remember <text to add to memory>")
     rid=log_raw("chat_user", f"/remember {text}", {"chat_id":update.effective_chat.id})
-    nid=remember("chat", text); await update.message.reply_text(f"🧠 Noted (note id {nid}, raw id {rid}). Essence kept, details in raw log.")
+    nid=remember("chat", text)
+    await update.message.reply_text(f"🧠 Noted (note id {nid}, raw id {rid}). Essence kept, details in raw log.")
 
 async def mem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     n=8
@@ -467,8 +623,9 @@ async def mem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def exportmem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id ASC")
-    rows=cur.fetchall(); data=[{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4] or "",
-                                "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""} for r in rows]
+    rows=cur.fetchall()
+    data=[{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4] or "",
+           "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""} for r in rows]
     path=Path("memory_export.json"); path.write_text(json.dumps(data, indent=2))
     await update.message.reply_document(document=str(path), filename="alex_memory.json")
 
@@ -489,6 +646,8 @@ async def raw_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(out)[:3900])
 
 # ----- owner approval flow for dangerous ops -----
+PENDING_CMDS: Dict[str, Dict[str,Any]] = {}  # id -> {type:'shell'|'py', 'cmd'|'code', 'chat_id'}
+
 async def queue_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
     if not PENDING_CMDS: return await update.message.reply_text("✅ Queue empty.")
@@ -545,30 +704,49 @@ async def py_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     doc=update.message.document
     if not doc: return
-    file_path=SAVE_DIR/doc.file_name; tg_file=await ctx.bot.get_file(doc.file_id); await tg_file.download_to_drive(file_path)
+    file_path=SAVE_DIR/doc.file_name
+    tg_file=await ctx.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(file_path)
     log_raw("file", f"Received file {doc.file_name}", {"file":str(file_path), "chat_id":update.effective_chat.id})
     await update.message.reply_text(f"📂 Saved `{doc.file_name}` — analyzing…", parse_mode="Markdown")
     name=doc.file_name.lower()
     if   name.endswith(".xlsx"): out=analyze_excel(file_path)
     elif name.endswith(".csv"):  out=analyze_csv(file_path)
     elif name.endswith(".json"): out=analyze_json(file_path)
-    else: remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I analyze Excel/CSV/JSON."
-    log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
+    else:
+        remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path))
+        out="Saved. I analyze Excel/CSV/JSON."
+    log_raw("chat_alex", out, {"chat_id":update.effective_chat.id})
+    await update.message.reply_text(out)
 
 async def handle_photo(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not update.message.photo: return
-    photo=update.message.photo[-1]; file=await ctx.bot.get_file(photo.file_id)
-    path=SAVE_DIR/f"photo_{photo.file_id}.jpg"; await file.download_to_drive(path)
-    out=analyze_image(path); log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
+    photo=update.message.photo[-1]
+    file=await ctx.bot.get_file(photo.file_id)
+    path=SAVE_DIR/f"photo_{photo.file_id}.jpg"
+    await file.download_to_drive(path)
+    out=analyze_image(path)
+    log_raw("chat_alex", out, {"chat_id":update.effective_chat.id})
+    await update.message.reply_text(out)
 
 async def handle_text(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     text=(update.message.text or "").strip()
     log_raw("chat_user", text, {"chat_id":update.effective_chat.id})
+
+    # URL auto-analyze
     if text.startswith(("http://","https://")):
-        await update.message.reply_text("🔍 Got your link — analyzing…"); res=await analyze_url(text)
-        log_raw("chat_alex", res, {"chat_id":update.effective_chat.id}); return await update.message.reply_text(res)
-    ans=await ask_ai(text); remember("chat", f"User said: {text}\nResponse gist: {ans[:400]}")
-    log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id}); await update.message.reply_text(ans)
+        await update.message.reply_text("🔍 Got your link — analyzing…")
+        res=await analyze_url(text)
+        log_raw("chat_alex", res, {"chat_id":update.effective_chat.id})
+        return await update.message.reply_text(res)
+
+    # Jarvis prefix
+    is_jarvis, prompt=_maybe_jarvis_text(text)
+    sysmsg = ("You are Alex (Jarvis) — voice-friendly, decisive, short.") if is_jarvis else persona_prompt()
+    ans=AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=800)
+    remember("chat", f"User said: {text}\nResponse gist: {ans[:400]}")
+    log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
+    await update.message.reply_text(ans)
 
 # ---------- live log watcher ----------
 def _post_to_subscribers(text:str):
@@ -576,18 +754,37 @@ def _post_to_subscribers(text:str):
     loop=GLOBAL_APP.bot._application.loop
     async def _send():
         for cid in list(MEM_RUNTIME["subscribers"]):
-            try: await GLOBAL_APP.bot.send_message(chat_id=cid, text=text)
-            except Exception: pass
-    try: asyncio.run_coroutine_threadsafe(_send(), loop)
-    except Exception: pass
+            try:
+                await GLOBAL_APP.bot.send_message(chat_id=cid, text=text)
+            except Exception:
+                pass
+    try:
+        asyncio.run_coroutine_threadsafe(_send(), loop)
+    except Exception:
+        pass
+
+TRADE_PATTERNS=[
+    re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
+    re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
+]
+
+def summarize_trade_line(line:str)->str|None:
+    for pat in TRADE_PATTERNS:
+        m=pat.search(line)
+        if m:
+            side,sym,qty,price=list(m.groups())
+            try: qty_i=int(qty)
+            except: qty_i=qty
+            return f"🟢 {side.upper()} {sym} qty {qty_i} @ {price}"
+    return None
 
 def watch_logs():
     last_size=0; last_raw_push=0
     while True:
         try:
-            write_heartbeat()
             path=MEM_RUNTIME.get("log_path") or ""
-            if not path or not Path(path).exists(): time.sleep(2); continue
+            if not path or not Path(path).exists():
+                time.sleep(2); continue
             p=Path(path); sz=p.stat().st_size
             if sz<last_size: last_size=0
             if sz>last_size:
@@ -602,21 +799,24 @@ def watch_logs():
                     if now-last_raw_push>15:
                         last_raw_push=now; _post_to_subscribers("📜 "+line[:900])
         except Exception as e:
-            logger.error("log watcher error: %s", e)
+            logging.error("log watcher error: %s", e)
         time.sleep(1)
 
 # ---------- persona synthesis worker ----------
 def learning_worker():
     while True:
         try:
-            cur.execute("SELECT content FROM notes ORDER BY id DESC LIMIT 24"); rec=[r[0] for r in cur.fetchall()]
+            cur.execute("SELECT content FROM notes ORDER BY id DESC LIMIT 24")
+            rec=[r[0] for r in cur.fetchall()]
             if rec:
                 persona=AI.chat(
                     [{"role":"system","content":"Create concise persona guidance from these snippets. 4–6 bullets."},
                      {"role":"user","content":"\n\n".join(rec)}],
                     max_tokens=220
                 )
-                tk="__persona__"; cur.execute("SELECT id FROM notes WHERE topic_key=? ORDER BY id DESC LIMIT 1",(tk,)); row=cur.fetchone()
+                tk="__persona__"
+                cur.execute("SELECT id FROM notes WHERE topic_key=? ORDER BY id DESC LIMIT 1",(tk,))
+                row=cur.fetchone()
                 if row:
                     cur.execute("UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=? WHERE id=?",
                                 (datetime.utcnow().isoformat(),"system","Persona",persona,"persona,profile","",row[0]))
@@ -625,12 +825,13 @@ def learning_worker():
                                    VALUES(?,?,?,?,?,?,?,?)""",
                                 (datetime.utcnow().isoformat(),"system",tk,"Persona",persona,"persona,profile","",""))
                 conn.commit()
-        except Exception as e: logger.error("learning error: %s", e)
+        except Exception as e:
+            logging.error("learning error: %s", e)
         time.sleep(60)
 
 # ---------- Simple STT/TTS scaffolding (OpenAI-only, optional) ----------
 def transcribe_bytes_wav(b:bytes)->str:
-    if BACKEND!="openai" or not USE_OPENAI_STT: return ""
+    if not USE_OPENAI_STT or not OPENAI_KEYS: return ""
     try:
         from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
         import tempfile
@@ -640,18 +841,16 @@ def transcribe_bytes_wav(b:bytes)->str:
             r=cli.audio.transcriptions.create(model="whisper-1", file=fh)
         return (r.text or "").strip()
     except Exception as e:
-        logger.warning("STT error: %s", e); return ""
+        logging.warning("STT error: %s", e); return ""
 
 def tts_to_mp3(text:str)->bytes:
-    if BACKEND!="openai" or not USE_OPENAI_TTS: return b""
+    if not USE_OPENAI_TTS or not OPENAI_KEYS: return b""
     try:
         from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
         r=cli.audio.speech.create(model="gpt-4o-mini-tts", voice=OPENAI_TTS_VOICE, input=text, format="mp3")
-        # SDKs vary; prefer bytes
-        if hasattr(r, "read"): return r.read()
-        return getattr(r, "content", b"") or b""
+        return r.read() if hasattr(r,"read") else (getattr(r,"content",b"") or b"")
     except Exception as e:
-        logger.warning("TTS error: %s", e); return b""
+        logging.warning("TTS error: %s", e); return b""
 
 # ---------- Keep-alive HTTP + iOS Shortcuts webhook ----------
 class Health(BaseHTTPRequestHandler):
@@ -662,14 +861,9 @@ class Health(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         if path=="/": return self._ok(b"ok")
         if path=="/health": return self._ok(b"ok")
-        # simple status
-        if path=="/status":
-            try:
-                facts=cur.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-            except Exception:
-                facts=0
-            msg=f"Alex alive {datetime.utcnow().isoformat()}Z\nbackend={BACKEND}\nfacts={facts}\n"
-            return self._ok(msg.encode("utf-8"))
+        if path=="/ollama_status":
+            status={"mode": STATE["backend_mode"], "urls": AI.list_ollama_urls()}
+            return self._ok(json.dumps(status).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
 
     def do_POST(self):
@@ -689,57 +883,111 @@ class Health(BaseHTTPRequestHandler):
             ans=AI.chat([{"role":"system","content":"You are Alex — concise, helpful, voice-friendly."},
                          {"role":"user","content":q}], max_tokens=300)
             remember("shortcut", f"Q: {q}\nA: {ans[:400]}")
-            # Optional TTS (base64 fix)
-            audio_bytes=tts_to_mp3(ans) if USE_OPENAI_TTS else b""
-            audio_b64=base64.b64encode(audio_bytes).decode("ascii") if audio_bytes else ""
-            body={"answer":ans, "audio_base64": audio_b64}
+            # Optional TTS
+            audio=tts_to_mp3(ans) if USE_OPENAI_TTS else b""
+            body={"answer":ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
+        def start_health():
+    HTTPServer(("0.0.0.0", PORT), Health).serve_forever()
 
-def start_health(): HTTPServer(("0.0.0.0", PORT), Health).serve_forever()
+# ---------- Backend / Jarvis / Guardrails control commands ----------
+async def backend_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args: return await update.message.reply_text("Usage: /backend <auto|openai|ollama>")
+    mode=ctx.args[0].strip().lower()
+    if mode not in ("auto","openai","ollama"):
+        return await update.message.reply_text("Use one of: auto | openai | ollama")
+    STATE["backend_mode"]=mode
+    AI.set_backend_mode(mode)
+    await update.message.reply_text(f"✅ Backend mode set to: {mode}")
 
-# ---------- Trading log parsing ----------
-TRADE_PATTERNS=[
-    re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
-    re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
-]
-def summarize_trade_line(line:str)->str|None:
-    for pat in TRADE_PATTERNS:
-        m=pat.search(line)
-        if m:
-            side,sym,qty,price=list(m.groups())
-            try: qty_i=int(qty)
-            except: qty_i=qty
-            return f"🟢 {side.upper()} {sym} qty {qty_i} @ {price}"
-    return None
+async def ollama_add_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args: return await update.message.reply_text("Usage: /ollama_add <url>")
+    url=" ".join(ctx.args).strip().rstrip("/")
+    AI.add_ollama_url(url)
+    await update.message.reply_text(f"✅ Added Ollama URL: {url}")
 
+async def ollama_list_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    urls=AI.list_ollama_urls()
+    await update.message.reply_text("Ollama URLs (priority order):\n"+"\n".join(urls) if urls else "No URLs configured.")
+
+async def ollama_status_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    urls=AI.list_ollama_urls()
+    statuses=[]
+    for u in urls:
+        try:
+            r=requests.get(f"{u}/api/version", timeout=6)
+            statuses.append(f"{u} :: {r.status_code}")
+        except Exception as e:
+            statuses.append(f"{u} :: error {e}")
+    await update.message.reply_text("Ollama status:\n"+"\n".join(statuses) if statuses else "No URLs configured.")
+
+async def jarvis_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    STATE["jarvis_mode"]=True
+    await update.message.reply_text("🧠 Jarvis mode: ON")
+
+async def jarvis_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    STATE["jarvis_mode"]=False
+    await update.message.reply_text("🧠 Jarvis mode: OFF")
+
+async def trust_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    STATE["dev_mode"]=True
+    await update.message.reply_text("⚙️ Guardrails: relaxed (still safe).")
+
+async def trust_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    STATE["dev_mode"]=False
+    await update.message.reply_text("⚙️ Guardrails: standard.")
+
+async def speak_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not ctx.args: return await update.message.reply_text("Usage: /speak <text>")
+    text=" ".join(ctx.args)
+    if not USE_OPENAI_TTS: return await update.message.reply_text("TTS disabled. Set USE_OPENAI_TTS=1.")
+    audio=tts_to_mp3(text)
+    if not audio: return await update.message.reply_text("TTS failed.")
+    path=Path("speech.mp3"); path.write_bytes(audio)
+    await update.message.reply_audio(audio=InputFile(str(path)), title="Alex says")
+
+# ---------- log path & subscription ----------
 async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     n=40
     if ctx.args:
         try: n=max(1,min(400,int(ctx.args[0])))
         except: pass
-    path=MEM_RUNTIME.get("log_path") or ""; p=Path(path)
+    path=MEM_RUNTIME.get("log_path") or ""
+    p=Path(path)
     if not path or not p.exists(): return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
     try:
-        lines=p.read_text(errors="ignore").splitlines()[-n:]; msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
+        lines=p.read_text(errors="ignore").splitlines()[-n:]
+        msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
         await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e: logger.exception("logs read error"); await update.message.reply_text(f"Read error: {e}")
+    except Exception as e:
+        logging.exception("logs read error"); await update.message.reply_text(f"Read error: {e}")
 
 async def setlog_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not ctx.args: return await update.message.reply_text("Usage: /setlog /path/to/your.log")
-    path=" ".join(ctx.args); MEM_RUNTIME["log_path"]=path
+    path=" ".join(ctx.args)
+    MEM_RUNTIME["log_path"]=path
     await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
 
 async def subscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id
-    if cid not in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].append(cid)
+    if cid not in MEM_RUNTIME["subscribers"]:
+        MEM_RUNTIME["subscribers"].append(cid)
     await update.message.reply_text("🔔 Subscribed to live log updates.")
 
 async def unsubscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id
-    if cid in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].remove(cid)
+    if cid in MEM_RUNTIME["subscribers"]:
+        MEM_RUNTIME["subscribers"].remove(cid)
     await update.message.reply_text("🔕 Unsubscribed.")
-    # ---------- Wire up Telegram + background threads ----------
+
+# ---------- Wire up Telegram + background threads ----------
 def build_app()->Application:
     app=Application.builder().token(TELEGRAM_TOKEN).build()
     # commands
@@ -749,7 +997,6 @@ def build_app()->Application:
     app.add_handler(CommandHandler("config", config_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("ai", ai_cmd))
-    app.add_handler(CommandHandler("jarvis", jarvis_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("analyze", analyze_cmd))
@@ -761,30 +1008,38 @@ def build_app()->Application:
     app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
     app.add_handler(CommandHandler("logs", logs_cmd))
+
+    # backend / jarvis / guardrails
+    app.add_handler(CommandHandler("backend", backend_cmd))
+    app.add_handler(CommandHandler("ollama_add", ollama_add_cmd))
+    app.add_handler(CommandHandler("ollama_list", ollama_list_cmd))
+    app.add_handler(CommandHandler("ollama_status", ollama_status_cmd))
+    app.add_handler(CommandHandler("jarvis_on", jarvis_on_cmd))
+    app.add_handler(CommandHandler("jarvis_off", jarvis_off_cmd))
+    app.add_handler(CommandHandler("trust_on", trust_on_cmd))
+    app.add_handler(CommandHandler("trust_off", trust_off_cmd))
+    app.add_handler(CommandHandler("speak", speak_cmd))
+
     # approval / dangerous ops
     app.add_handler(CommandHandler("queue", queue_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("deny", deny_cmd))
     app.add_handler(CommandHandler("shell", shell_request_cmd))
     app.add_handler(CommandHandler("py", py_request_cmd))
+
     # messages
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
-def heartbeat_worker():
-    while True:
-        write_heartbeat()
-        time.sleep(30)
-
 # ---------- main ----------
 def main():
     global GLOBAL_APP
     if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
-    if BACKEND=="openai" and not OPENAI_KEYS:
-        logger.warning("OpenAI backend selected but no OPENAI_API_KEY(S) provided.")
+        logging.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
+    if AI.backend_mode in ("auto","openai") and not OPENAI_KEYS:
+        logging.warning("OpenAI path may be used but no OPENAI_API_KEY(S) provided.")
 
     app=build_app(); GLOBAL_APP=app
 
@@ -792,9 +1047,11 @@ def main():
     threading.Thread(target=start_health, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
-    threading.Thread(target=heartbeat_worker, daemon=True).start()
 
-    logger.info("🚀 Alex mega bot starting…"); app.run_polling(close_loop=False)
+    logging.info("🚀 Alex mega bot starting…")
+    logging.info("Jarvis=%s | DevMode=%s | Backend=%s | OllamaURLs=%s",
+                 STATE['jarvis_mode'], STATE['dev_mode'], STATE['backend_mode'], AI.list_ollama_urls())
+    app.run_polling(close_loop=False)
 
 if __name__=="__main__":
     main()
@@ -803,14 +1060,16 @@ if __name__=="__main__":
 # Quick env checklist:
 # TELEGRAM_TOKEN=<bot token>
 # OWNER_ID=<your telegram numeric id>
-# BACKEND=openai|ollama
+# BACKEND=auto|openai|ollama
 #   OPENAI_API_KEYS=key1,key2,...   (or OPENAI_API_KEY=single)
 #   OPENAI_MODEL=gpt-4o-mini
-#   OLLAMA_HOST=http://localhost:11434
+# OLLAMA_URLS=https://YOUR-NGROK-ID.ngrok.app,http://YOUR-LAN-IP:11434,http://localhost:11434
 #   OLLAMA_MODEL=llama3.1:8b-instruct
 # SERPAPI_KEY=<optional>
 # HUMANE_TONE=1
 # SHORTCUT_SECRET=<something-long>  (for /shortcut endpoint)
 # USE_OPENAI_STT=0|1, USE_OPENAI_TTS=0|1, OPENAI_TTS_VOICE=alloy
 # PORT=8080
+# JARVIS_MODE=0|1  (default Jarvis persona)
+# DEV_MODE=0|1     (relaxed style; still safe; owner can /trust_on)
 # =========================
