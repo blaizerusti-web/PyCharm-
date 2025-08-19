@@ -1,41 +1,15 @@
 # =========================
-# mega.py — Alex (Railway/GitHub ready, compact + fully-featured, w/ OpenAI key rotation or Ollama)
-# =========================
-# Features:
-# - Telegram bot (python-telegram-bot v20)
-# - Raw append-only memory (SQLite) + JSONL backup
-# - Humane summaries/merge + topic-key clustering
-# - RAG-style recall (/ask) across notes + raw
-# - URL crawler + SEO summarize + ingest
-# - File analyzers: Excel/CSV/JSON + ingest
-# - Image ingest: EXIF + (optional) OCR + ingest
-# - Live log watcher (/setlog, /subscribe_logs, /logs) + trade-line summarizer
-# - Persona auto-learning worker (periodically distills notes)
-# - Health server (PORT for Railway), backup/export/config
-# - SerpAPI search (/search)
-# - AI backend: OpenAI (safe multi-key rotation + backoff) or Ollama
-#
-# Env (required): TELEGRAM_TOKEN
-# Env (AI backend):
-#   BACKEND=openai|ollama   (default openai)
-#   # OpenAI:
-#   OPENAI_API_KEYS="key1,key2,..." or OPENAI_API_KEY="single"
-#   OPENAI_MODEL=gpt-4o-mini (default)
-#   # Ollama:
-#   OLLAMA_HOST=http://localhost:11434 (default)
-#   OLLAMA_MODEL=llama3.1:8b-instruct (default)
-# Other env:
-#   SERPAPI_KEY (optional for /search)
-#   PORT=8080 (default for health)
-#   HUMANE_TONE=1 (default 1)
+# mega.py — Alex (OpenAI key-rotation or Ollama; Telegram; Memory; RAG; Shortcuts webhook)
 # =========================
 
-import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile, random
+import os, sys, json, time, re, logging, threading, hashlib, sqlite3, asyncio, subprocess, math, zipfile, random, uuid
 from pathlib import Path
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+from typing import Optional, Dict, Any, List
 
-# ---------- bootstrap: install/import (auto-installs missing deps) ----------
+# ---------- bootstrap: install/import ----------
 def _ensure(import_name: str, pip_name: str | None = None):
     try:
         return __import__(import_name)
@@ -47,11 +21,8 @@ requests=_ensure("requests"); aiohttp=_ensure("aiohttp")
 _ensure("bs4","beautifulsoup4"); _ensure("pandas"); _ensure("openpyxl"); _ensure("PIL","Pillow")
 t_ext=_ensure("telegram.ext","python-telegram-bot==20.*"); telegram=_ensure("telegram")
 
-# Optional OCR module (system must also have tesseract binary installed to actually OCR)
-try:
-    _ensure("pytesseract"); HAS_TESS=True
-except Exception:
-    HAS_TESS=False
+try: _ensure("pytesseract"); HAS_TESS=True
+except Exception: HAS_TESS=False
 
 from PIL import Image, ExifTags
 from bs4 import BeautifulSoup
@@ -61,46 +32,46 @@ import pandas as pd
 
 # ---------- config / logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN","").strip()
-SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
+OWNER_ID=os.getenv("OWNER_ID","").strip()   # your Telegram numeric user id
 PORT=int(os.getenv("PORT","8080"))
+SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
 HUMANE_TONE=os.getenv("HUMANE_TONE","1")=="1"
 
+# AI backend
 BACKEND=os.getenv("BACKEND","openai").strip().lower()
 OPENAI_MODEL=os.getenv("OPENAI_MODEL","gpt-4o-mini").strip()
 OPENAI_KEYS=[k.strip() for k in os.getenv("OPENAI_API_KEYS","").split(",") if k.strip()]
 if not OPENAI_KEYS and os.getenv("OPENAI_API_KEY","").strip():
     OPENAI_KEYS=[os.getenv("OPENAI_API_KEY","").strip()]
+
 OLLAMA_HOST=os.getenv("OLLAMA_HOST","http://localhost:11434").strip().rstrip("/")
 OLLAMA_MODEL=os.getenv("OLLAMA_MODEL","llama3.1:8b-instruct").strip()
 
-if not TELEGRAM_TOKEN: logging.warning("TELEGRAM_TOKEN not set (required).")
-logging.info("AI backend: %s", BACKEND)
-if BACKEND=="openai":
-    logging.info("OpenAI model: %s | keys: %d provided", OPENAI_MODEL, len(OPENAI_KEYS))
-elif BACKEND=="ollama":
-    logging.info("Ollama model: %s @ %s", OLLAMA_MODEL, OLLAMA_HOST)
+# iOS Shortcuts webhook secret (required for /shortcut)
+SHORTCUT_SECRET=os.getenv("SHORTCUT_SECRET","").strip()
 
-logging.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available (EXIF only)")
+# Optional STT/TTS flags (OpenAI only)
+USE_OPENAI_STT=os.getenv("USE_OPENAI_STT","0")=="1"
+USE_OPENAI_TTS=os.getenv("USE_OPENAI_TTS","0")=="1"
+OPENAI_TTS_VOICE=os.getenv("OPENAI_TTS_VOICE","alloy")
+
+if not TELEGRAM_TOKEN: logging.warning("TELEGRAM_TOKEN not set (required).")
+logging.info("Backend: %s | OpenAI model=%s (keys=%d) | Ollama=%s @ %s",
+             BACKEND, OPENAI_MODEL, len(OPENAI_KEYS), OLLAMA_MODEL, OLLAMA_HOST)
+logging.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available")
 
 START_TIME=time.time()
 SAVE_DIR=Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
 
-# ---------- AI backend (OpenAI with rotation/backoff OR Ollama) ----------
+# ---------- AI backend (OpenAI rotation/backoff OR Ollama) ----------
 class AIBackend:
-    """
-    Unifies chat across OpenAI or Ollama.
-    - OpenAI: rotates your own API keys if provided; retries on 429/network with exponential backoff.
-      This improves reliability but does not bypass provider policies.
-    - Ollama: local/server model via REST.
-    """
     def __init__(self, backend:str):
         self.backend=backend
         self._key_idx=0
         self._session = requests.Session()
-
         if backend=="openai":
-            # Lazy import to avoid hard dependency if using Ollama
             try:
                 from openai import OpenAI as _New
                 self._new_sdk_cls=_New
@@ -112,75 +83,58 @@ class AIBackend:
             except Exception:
                 self._old_sdk=None
 
-    def _pick_key(self):
-        if not OPENAI_KEYS:
-            return None
-        # simple round-robin
-        key = OPENAI_KEYS[self._key_idx % len(OPENAI_KEYS)]
-        self._key_idx = (self._key_idx + 1) % max(1,len(OPENAI_KEYS))
-        return key
+    def _pick_key(self)->Optional[str]:
+        if not OPENAI_KEYS: return None
+        k=OPENAI_KEYS[self._key_idx % len(OPENAI_KEYS)]
+        self._key_idx=(self._key_idx+1) % max(1,len(OPENAI_KEYS))
+        return k
 
-    def chat(self, messages:list[dict], model:str=None, max_tokens:int=800, timeout:float=45.0)->str:
-        model = model or (OPENAI_MODEL if self.backend=="openai" else OLLAMA_MODEL)
+    def chat(self, messages:List[Dict[str,Any]], model:str=None, max_tokens:int=800, timeout:float=60.0)->str:
+        model=model or (OPENAI_MODEL if self.backend=="openai" else OLLAMA_MODEL)
         if self.backend=="ollama":
-            # Non-streaming chat with Ollama REST /api/chat
             try:
-                payload={"model":model,"messages":messages,"stream":False,"options":{}}
+                payload={"model":model,"messages":messages,"stream":False}
                 r=self._session.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
-                r.raise_for_status()
-                j=r.json()
-                # Ollama returns {"message":{"content":"..."}, "done":true, ...}
-                if "message" in j and "content" in j["message"]:
-                    return (j["message"]["content"] or "").strip()
-                # Some versions return accumulated "messages" or "response"
-                if "response" in j:
-                    return (j["response"] or "").strip()
+                r.raise_for_status(); j=r.json()
+                if "message" in j and "content" in j["message"]: return (j["message"]["content"] or "").strip()
+                if "response" in j: return (j["response"] or "").strip()
                 return "⚠️ Ollama: unexpected response."
             except Exception as e:
-                logging.exception("Ollama chat error")
-                return f"⚠️ Ollama error: {e}"
+                logging.exception("Ollama chat error"); return f"⚠️ Ollama error: {e}"
 
-        # OpenAI path with rotation/backoff
-        if not OPENAI_KEYS:
-            return "⚠️ OPENAI_API_KEY(S) not set."
-
-        attempts = max(3, len(OPENAI_KEYS))  # try at least 3 times or once per key
-        base_sleep=1.2
+        # OpenAI path
+        if not OPENAI_KEYS: return "⚠️ OPENAI_API_KEY(S) not set."
+        attempts=max(3, len(OPENAI_KEYS)); base_sleep=1.2
         for i in range(attempts):
             key=self._pick_key()
-            if not key: return "⚠️ No OpenAI key available."
             try:
-                # Try new SDK first if import worked
                 if self._new_sdk_cls:
                     cli=self._new_sdk_cls(api_key=key)
                     r=cli.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens)
                     return r.choices[0].message.content.strip()
-                # Fallback to old SDK
                 elif self._old_sdk:
-                    self._old_sdk.api_key = key
+                    self._old_sdk.api_key=key
                     r=self._old_sdk.ChatCompletion.create(model=model, messages=messages, max_tokens=max_tokens, request_timeout=timeout)
                     return r["choices"][0]["message"]["content"].strip()
                 else:
                     return "⚠️ OpenAI SDK not available."
             except Exception as e:
-                # If it's a rate/quota/network, backoff and rotate
                 msg=str(e).lower()
-                retriable = any(t in msg for t in ["rate limit", "quota", "429", "timeout", "temporarily unavailable", "connection", "tls", "service unavailable"])
-                logging.warning("OpenAI call failed on attempt %d/%d with key idx %d: %s", i+1, attempts, self._key_idx-1, e)
+                retriable=any(t in msg for t in ["rate limit","quota","429","timeout","temporarily","connection","service unavailable"])
+                logging.warning("OpenAI attempt %d/%d failed: %s", i+1, attempts, e)
                 if i<attempts-1 and retriable:
-                    sleep = base_sleep * (2 ** i) + random.random()*0.5
-                    time.sleep(sleep)
+                    time.sleep(base_sleep*(2**i)+random.random()*0.5)
                     continue
                 return f"⚠️ OpenAI error: {e}"
         return "⚠️ OpenAI: all attempts failed."
 
-AI = AIBackend(BACKEND)
+AI=AIBackend(BACKEND)
 
 async def ask_ai(prompt:str, context:str="")->str:
-    sysmsg = context or "You are Alex — concise, helpful, a little witty."
-    return AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=800)
+    return AI.chat([{"role":"system","content":context or "You are Alex — concise, helpful, a little witty."},
+                    {"role":"user","content":prompt}], max_tokens=800)
 
-# ---------- SQLite: RAW memory (append-only) + NOTES (summaries) ----------
+# ---------- SQLite memory ----------
 DB_PATH="alex_memory.db"; conn=sqlite3.connect(DB_PATH, check_same_thread=False); cur=conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS raw_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, type TEXT NOT NULL, text TEXT NOT NULL, meta TEXT)""")
@@ -202,7 +156,7 @@ def log_raw(ev_type:str, text:str, meta:dict|None=None)->int:
     rid=cur.lastrowid; _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
     logging.info("raw[%s] %s: %s", rid, ev_type, (text[:200]+"…") if len(text)>200 else text); return rid
 
-# ---------- Summarisation + topic merge ----------
+# summarization + topic merge
 def _topic_key(text:str)->str:
     seed=re.sub(r"[^a-z0-9 ]+"," ",re.sub(r"https?://\S+","",text.lower())); seed=" ".join(seed.split()[:12])
     return hashlib.sha1(seed.encode()).hexdigest()
@@ -210,7 +164,7 @@ def _topic_key(text:str)->str:
 def _merge_contents(old:str, new:str)->str:
     try:
         return AI.chat(
-            [{"role":"system","content":"Merge NEW into EXISTING. ≤120 words, bullet style OK. Preserve key facts/numbers."},
+            [{"role":"system","content":"Merge NEW into EXISTING. ≤120 words, bullets ok. Preserve key facts/numbers."},
              {"role":"user","content":f"EXISTING:\n{old}\n\nNEW:\n{new}"}],
             max_tokens=240
         )
@@ -219,7 +173,7 @@ def _merge_contents(old:str, new:str)->str:
 
 def _humane_summarize(text:str, capture_tone:bool=True)->dict:
     sysmsg="Compress into human memory: 3–6 bullets or 2–4 short sentences; essentials only."
-    if capture_tone and HUMANE_TONE: sysmsg+=" Detect tone (positive/neutral/negative + short descriptor)."
+    if capture_tone and HUMANE_TONE: sysmsg+=" Detect tone (positive/neutral/negative + brief)."
     prompt=f"Digest this into humane memory.\n\nTEXT:\n{text}\n\nReturn JSON: title, summary, tags (3-6), sentiment."
     try:
         out=AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=360)
@@ -237,41 +191,20 @@ def remember(source:str, text:str, raw_ref:str="")->int:
         nid, existing=row; merged=_merge_contents(existing, digest["summary"])
         cur.execute("""UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=?,raw_ref=? WHERE id=?""",
                     (datetime.utcnow().isoformat(),source,digest["title"],merged,digest["tags"],digest["sentiment"],raw_ref,nid))
-        conn.commit(); logging.info("notes merge id=%s topic=%s", nid, topic); return nid
+        conn.commit(); return nid
     cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (datetime.utcnow().isoformat(),source,topic,digest["title"],digest["summary"],digest["tags"],digest["sentiment"],raw_ref))
-    conn.commit(); nid=cur.lastrowid; logging.info("notes add id=%s topic=%s", nid, topic); return nid
-
-def recent_notes(n:int=10)->list[dict]:
-    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id DESC LIMIT ?",(n,))
-    return [{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4],
-             "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""} for r in cur.fetchall()]
-
-def export_all_notes()->list[dict]:
-    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id ASC")
-    rows=cur.fetchall()
-    return [{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4],
-             "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""} for r in rows]
-
-def recent_raw(n:int=50)->list[dict]:
-    cur.execute("SELECT id,ts,type,text,meta FROM raw_events ORDER BY id DESC LIMIT ?",(n,))
-    out=[]
-    for r in cur.fetchall():
-        try: meta=json.loads(r[4] or "{}")
-        except: meta={}
-        out.append({"id":r[0],"ts":r[1],"type":r[2],"text":r[3],"meta":meta})
-    return out
-
-# ---------- Simple lexical search (no extra deps) ----------
+    conn.commit(); return cur.lastrowid
+    # ---------- simple lexical search ----------
 _WORD_RE=re.compile(r"[a-z0-9]+")
-def _tokenize(s:str)->list[str]: return _WORD_RE.findall(s.lower())
-def _tf(tokens:list[str])->dict[str,float]:
+def _tokenize(s:str)->List[str]: return _WORD_RE.findall(s.lower())
+def _tf(tokens:List[str])->Dict[str,float]:
     d={}; n=float(len(tokens)) or 1.0
     for t in tokens: d[t]=d.get(t,0)+1.0
     for k in d: d[k]/=n
     return d
-def _cosine(a:dict[str,float], b:dict[str,float])->float:
+def _cosine(a:Dict[str,float], b:Dict[str,float])->float:
     if not a or not b: return 0.0
     common=set(a)&set(b); num=sum(a[t]*b[t] for t in common)
     da=math.sqrt(sum(v*v for v in a.values())); db=math.sqrt(sum(v*v for v in b.values()))
@@ -297,7 +230,6 @@ def search_memory(query:str, k_raw:int=12, k_notes:int=12)->dict:
     notes_top=[x[1] for x in sorted(note_scored,key=lambda z:z[0],reverse=True)[:k_notes]]
     return {"raw":raw_top,"notes":notes_top}
 
-# ---------- RAG-style answer ----------
 def build_context_blurb(found:dict, max_chars:int=3800)->str:
     parts=[]
     for n in found.get("notes",[]):
@@ -409,35 +341,25 @@ def analyze_image(path:Path)->str:
     except Exception as e:
         log_raw("image", f"Image load error {path.name}: {e}", {"file": str(path)})
         logging.exception("Image analysis error"); return f"⚠️ Image analysis error: {e}"
-
-# ---------- Trading log parsing ----------
-TRADE_PATTERNS=[
-    re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
-    re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
-]
-def summarize_trade_line(line:str)->str|None:
-    for pat in TRADE_PATTERNS:
-        m=pat.search(line)
-        if m:
-            side,sym,qty,price=list(m.groups())
-            try: qty_i=int(qty)
-            except: qty_i=qty
-            return f"🟢 {side.upper()} {sym} qty {qty_i} @ {price}"
-    return None
-
-# ---------- Telegram handlers ----------
+        # ---------- Telegram handlers ----------
 GLOBAL_APP:Application|None=None
 MEM_RUNTIME={"log_path":"", "subscribers": []}
+
+# ----- Approval queue for dangerous ops -----
+PENDING_CMDS: Dict[str, Dict[str,Any]] = {}  # id -> {type:'shell'|'py', 'cmd'|'code', 'chat_id'}
+
+def _owner_only(update:Update)->bool:
+    return OWNER_ID and str(update.effective_user.id)==str(OWNER_ID)
 
 async def start_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hey, I'm Alex 🤖\n"
-        "I keep a perfect raw log and recall with concise insights.\n\n"
         "Core: /ask <question>\n"
         "Ingest: /analyze <url>, send images & .xlsx/.csv/.json files\n"
         "Memory: /remember <text>, /mem [n], /exportmem, /raw [n]\n"
         "Logs: /setlog <path>, /subscribe_logs, /unsubscribe_logs, /logs [n]\n"
-        "Utils: /ai <prompt>, /search <query>, /id, /uptime, /backup, /config"
+        "Utils: /ai <prompt>, /search <query>, /id, /uptime, /backup, /config\n"
+        "Dangerous ops require owner approval: /queue, /approve <id>, /deny <id>"
     )
 
 async def id_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -449,7 +371,8 @@ async def uptime_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def config_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     flags={"BACKEND":BACKEND,"OPENAI_MODEL":OPENAI_MODEL,"OLLAMA_MODEL":OLLAMA_MODEL,"HUMANE_TONE":HUMANE_TONE,
-           "HAS_TESS":HAS_TESS,"SERPAPI_KEY_set":bool(SERPAPI_KEY),"DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),"PORT":PORT}
+           "HAS_TESS":HAS_TESS,"SERPAPI_KEY_set":bool(SERPAPI_KEY),"DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),
+           "PORT":PORT,"USE_OPENAI_STT":USE_OPENAI_STT,"USE_OPENAI_TTS":USE_OPENAI_TTS}
     await update.message.reply_text("Config:\n"+json.dumps(flags, indent=2))
 
 async def backup_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -505,19 +428,23 @@ async def mem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if ctx.args:
         try: n=max(1,min(40,int(ctx.args[0])))
         except: pass
-    items=recent_notes(n)
-    if not items: return await update.message.reply_text("🧠 Memory is empty (for now).")
+    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id DESC LIMIT ?",(n,))
+    rows=cur.fetchall()
+    if not rows: return await update.message.reply_text("🧠 Memory is empty (for now).")
     lines=[]
-    for it in items:
-        lines.append(f"#{it['id']} [{it['source']}] {it['title'] or '(no title)'}")
-        lines.append("  "+it["content"].replace("\n","\n  ")[:700])
-        if it["tags"]: lines.append(f"  tags: {it['tags']}")
-        if it["ref"]:  lines.append(f"  ref: {it['ref']}")
+    for r in rows:
+        lines.append(f"#{r[0]} [{r[2]}] {r[3] or '(no title)'}")
+        lines.append("  "+(r[4] or "").replace("\n","\n  ")[:700])
+        if r[5]: lines.append(f"  tags: {r[5]}")
+        if r[7]: lines.append(f"  ref: {r[7]}")
         lines.append("")
     await update.message.reply_text("\n".join(lines)[:3900])
 
 async def exportmem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    data=export_all_notes(); path=Path("memory_export.json"); path.write_text(json.dumps(data, indent=2))
+    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id ASC")
+    rows=cur.fetchall(); data=[{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4] or "",
+                                "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""} for r in rows]
+    path=Path("memory_export.json"); path.write_text(json.dumps(data, indent=2))
     await update.message.reply_document(document=str(path), filename="alex_memory.json")
 
 async def raw_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -525,55 +452,71 @@ async def raw_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if ctx.args:
         try: n=max(1,min(200,int(ctx.args[0])))
         except: pass
-    rows=recent_raw(n)
+    cur.execute("SELECT id,ts,type,text,meta FROM raw_events ORDER BY id DESC LIMIT ?",(n,))
+    rows=cur.fetchall()
     if not rows: return await update.message.reply_text("Raw memory is empty.")
     out=[]
     for r in rows:
-        meta=r.get("meta",{}); mtxt=f" | meta: {meta}" if meta else ""; txt=r["text"].replace("\n"," ")[:800]
-        out.append(f"#{r['id']} [{r['ts']} | {r['type']}] {txt}{mtxt}")
+        try: meta=json.loads(r[4] or "{}")
+        except: meta={}
+        txt=(r[3] or "").replace("\n"," ")[:800]; mtxt=f" | meta: {meta}" if meta else ""
+        out.append(f"#{r[0]} [{r[1]} | {r[2]}] {txt}{mtxt}")
     await update.message.reply_text("\n".join(out)[:3900])
 
-async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    n=40
-    if ctx.args:
-        try: n=max(1,min(400,int(ctx.args[0])))
-        except: pass
-    path=MEM_RUNTIME.get("log_path") or ""; p=Path(path)
-    if not path or not p.exists(): return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
-    try:
-        lines=p.read_text(errors="ignore").splitlines()[-n:]; msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e: logging.exception("logs read error"); await update.message.reply_text(f"Read error: {e}")
+# ----- owner approval flow for dangerous ops -----
+async def queue_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not PENDING_CMDS: return await update.message.reply_text("✅ Queue empty.")
+    lines=[]
+    for k,v in PENDING_CMDS.items():
+        lines.append(f"{k} :: {v['type']} :: {(v.get('cmd') or v.get('code'))[:80]}")
+    await update.message.reply_text("\n".join(lines)[:3900])
 
-async def setlog_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return await update.message.reply_text("Usage: /setlog /path/to/your.log")
-    path=" ".join(ctx.args); MEM_RUNTIME["log_path"]=path
-    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
+async def approve_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args: return await update.message.reply_text("Usage: /approve <id>")
+    rid=ctx.args[0].strip()
+    job=PENDING_CMDS.pop(rid, None)
+    if not job: return await update.message.reply_text("Not found.")
+    if job["type"]=="shell":
+        try:
+            result=subprocess.check_output(job["cmd"], shell=True, text=True, stderr=subprocess.STDOUT, timeout=60)
+            await update.message.reply_text(f"💻 OK ({rid})\n{result[:3900]}")
+        except subprocess.CalledProcessError as e:
+            await update.message.reply_text(f"❌ Error ({rid}):\n{(e.output or str(e))[:3900]}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Exec error: {e}")
+    elif job["type"]=="py":
+        try:
+            loc={}; exec(job["code"], {}, loc)  # sandbox-light; trust owner only
+            await update.message.reply_text(f"🐍 Py OK ({rid}) — keys: {list(loc.keys())[:12]}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Py error ({rid}): {e}")
+    else:
+        await update.message.reply_text("Unknown job type.")
 
-async def subscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    cid=update.effective_chat.id
-    if cid not in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].append(cid)
-    await update.message.reply_text("🔔 Subscribed to live log updates.")
+async def deny_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args: return await update.message.reply_text("Usage: /deny <id>")
+    rid=ctx.args[0].strip()
+    if rid in PENDING_CMDS:
+        PENDING_CMDS.pop(rid, None); await update.message.reply_text(f"🛑 Denied {rid}.")
+    else:
+        await update.message.reply_text("Not found.")
 
-async def unsubscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    cid=update.effective_chat.id
-    if cid in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].remove(cid)
-    await update.message.reply_text("🔕 Unsubscribed.")
+async def shell_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cmd=" ".join(ctx.args).strip()
+    if not cmd: return await update.message.reply_text("Usage: /shell <command>")
+    job_id=str(uuid.uuid4())[:8]; PENDING_CMDS[job_id]={"type":"shell","cmd":cmd,"chat_id":update.effective_chat.id}
+    await update.message.reply_text(f"⌛ Queued shell command for approval. ID: `{job_id}`", parse_mode="Markdown")
 
-# --- text messages (general) ---
-async def handle_text(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    text=(update.message.text or "").strip()
-    log_raw("chat_user", text, {"chat_id":update.effective_chat.id})
-    if text.lower()=="analyse alex_profile":
-        msg="Back in the zone. What’s next?"; log_raw("chat_alex", msg, {"chat_id":update.effective_chat.id})
-        return await update.message.reply_text(msg)
-    if text.startswith(("http://","https://")):
-        await update.message.reply_text("🔍 Got your link — analyzing…"); res=await analyze_url(text)
-        log_raw("chat_alex", res, {"chat_id":update.effective_chat.id}); return await update.message.reply_text(res)
-    ans=await ask_ai(text); remember("chat", f"User said: {text}\nResponse gist: {ans[:400]}")
-    log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id}); await update.message.reply_text(ans)
+async def py_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    code=" ".join(ctx.args).strip()
+    if not code: return await update.message.reply_text("Usage: /py <single-line python> (multi-line not supported here)")
+    job_id=str(uuid.uuid4())[:8]; PENDING_CMDS[job_id]={"type":"py","code":code,"chat_id":update.effective_chat.id}
+    await update.message.reply_text(f"⌛ Queued python for approval. ID: `{job_id}`", parse_mode="Markdown")
 
-# --- document uploads ---
+# --- uploads ---
 async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     doc=update.message.document
     if not doc: return
@@ -584,17 +527,24 @@ async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if   name.endswith(".xlsx"): out=analyze_excel(file_path)
     elif name.endswith(".csv"):  out=analyze_csv(file_path)
     elif name.endswith(".json"): out=analyze_json(file_path)
-    else: remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I currently analyze Excel (.xlsx), CSV, and JSON."
+    else: remember("file", f"Received file {doc.file_name}", raw_ref=str(file_path)); out="Saved. I analyze Excel/CSV/JSON."
     log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
 
-# --- photo uploads ---
 async def handle_photo(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not update.message.photo: return
     photo=update.message.photo[-1]; file=await ctx.bot.get_file(photo.file_id)
     path=SAVE_DIR/f"photo_{photo.file_id}.jpg"; await file.download_to_drive(path)
     out=analyze_image(path); log_raw("chat_alex", out, {"chat_id":update.effective_chat.id}); await update.message.reply_text(out)
 
-# ---------- live log watcher (push to subscribers) ----------
+async def handle_text(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    text=(update.message.text or "").strip()
+    log_raw("chat_user", text, {"chat_id":update.effective_chat.id})
+    if text.startswith(("http://","https://")):
+        await update.message.reply_text("🔍 Got your link — analyzing…"); res=await analyze_url(text)
+        log_raw("chat_alex", res, {"chat_id":update.effective_chat.id}); return await update.message.reply_text(res)
+    ans=await ask_ai(text); remember("chat", f"User said: {text}\nResponse gist: {ans[:400]}")
+    log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id}); await update.message.reply_text(ans)
+    # ---------- live log watcher ----------
 def _post_to_subscribers(text:str):
     if not GLOBAL_APP or not MEM_RUNTIME.get("subscribers"): return
     loop=GLOBAL_APP.bot._application.loop
@@ -612,7 +562,7 @@ def watch_logs():
             path=MEM_RUNTIME.get("log_path") or ""
             if not path or not Path(path).exists(): time.sleep(2); continue
             p=Path(path); sz=p.stat().st_size
-            if sz<last_size: last_size=0  # rotation
+            if sz<last_size: last_size=0
             if sz>last_size:
                 with p.open("r", errors="ignore") as f:
                     if last_size: f.seek(last_size)
@@ -651,21 +601,110 @@ def learning_worker():
         except Exception as e: logging.error("learning error: %s", e)
         time.sleep(60)
 
-# ---------- health server ----------
+# ---------- Simple STT/TTS scaffolding (OpenAI-only, optional) ----------
+def transcribe_bytes_wav(b:bytes)->str:
+    if BACKEND!="openai" or not USE_OPENAI_STT: return ""
+    try:
+        from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            tf.write(b); tf.flush(); path=tf.name
+        with open(path,"rb") as fh:
+            # whisper-1 or gpt-4o-mini-transcribe depending on your account
+            r=cli.audio.transcriptions.create(model="whisper-1", file=fh)
+        return (r.text or "").strip()
+    except Exception as e:
+        logging.warning("STT error: %s", e); return ""
+
+def tts_to_mp3(text:str)->bytes:
+    if BACKEND!="openai" or not USE_OPENAI_TTS: return b""
+    try:
+        from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
+        r=cli.audio.speech.create(model="gpt-4o-mini-tts", voice=OPENAI_TTS_VOICE, input=text, format="mp3")
+        return r.read() if hasattr(r,"read") else (getattr(r,"content",b"") or b"")
+    except Exception as e:
+        logging.warning("TTS error: %s", e); return b""
+
+# ---------- Keep-alive HTTP + iOS Shortcuts webhook ----------
 class Health(BaseHTTPRequestHandler):
+    def _ok(self, body:bytes=b"ok", code:int=200, ctype:str="text/plain"):
+        self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(body)
+
     def do_GET(self):
-        self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"ok")
+        path=urlparse(self.path).path
+        if path=="/": return self._ok(b"ok")
+        if path=="/health": return self._ok(b"ok")
+        return self._ok(b"not found", 404)
+
+    def do_POST(self):
+        path=urlparse(self.path).path
+        try:
+            length=int(self.headers.get("Content-Length","0"))
+            raw=self.rfile.read(length) if length>0 else b""
+            data=json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            data={}
+        # /shortcut — called from iOS/Apple Watch Shortcuts
+        if path=="/shortcut":
+            if not SHORTCUT_SECRET or data.get("secret")!=SHORTCUT_SECRET:
+                return self._ok(b'{"error":"unauthorized"}', 401, "application/json")
+            q=(data.get("q") or "").strip()
+            if not q: return self._ok(b'{"error":"missing q"}', 400, "application/json")
+            ans=AI.chat([{"role":"system","content":"You are Alex — concise, helpful, voice-friendly."},
+                         {"role":"user","content":q}], max_tokens=300)
+            remember("shortcut", f"Q: {q}\nA: {ans[:400]}")
+            # Optional TTS
+            audio=tts_to_mp3(ans) if USE_OPENAI_TTS else b""
+            body={"answer":ans, "audio_base64": (audio.decode("latin1") if audio else "")}
+            return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
+        return self._ok(b"not found", 404)
+
 def start_health(): HTTPServer(("0.0.0.0", PORT), Health).serve_forever()
+    # ---------- Trading log parsing ----------
+TRADE_PATTERNS=[
+    re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
+    re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
+]
+def summarize_trade_line(line:str)->str|None:
+    for pat in TRADE_PATTERNS:
+        m=pat.search(line)
+        if m:
+            side,sym,qty,price=list(m.groups())
+            try: qty_i=int(qty)
+            except: qty_i=qty
+            return f"🟢 {side.upper()} {sym} qty {qty_i} @ {price}"
+    return None
 
-# ---------- main ----------
-def main():
-    global GLOBAL_APP
-    if not TELEGRAM_TOKEN:
-        logging.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
-    if BACKEND=="openai" and not OPENAI_KEYS:
-        logging.warning("OpenAI backend selected but no OPENAI_API_KEY(S) provided.")
-    app=Application.builder().token(TELEGRAM_TOKEN).build(); GLOBAL_APP=app
+async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    n=40
+    if ctx.args:
+        try: n=max(1,min(400,int(ctx.args[0])))
+        except: pass
+    path=MEM_RUNTIME.get("log_path") or ""; p=Path(path)
+    if not path or not p.exists(): return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
+    try:
+        lines=p.read_text(errors="ignore").splitlines()[-n:]; msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e: logging.exception("logs read error"); await update.message.reply_text(f"Read error: {e}")
 
+async def setlog_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not ctx.args: return await update.message.reply_text("Usage: /setlog /path/to/your.log")
+    path=" ".join(ctx.args); MEM_RUNTIME["log_path"]=path
+    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
+
+async def subscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cid=update.effective_chat.id
+    if cid not in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].append(cid)
+    await update.message.reply_text("🔔 Subscribed to live log updates.")
+
+async def unsubscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    cid=update.effective_chat.id
+    if cid in MEM_RUNTIME["subscribers"]: MEM_RUNTIME["subscribers"].remove(cid)
+    await update.message.reply_text("🔕 Unsubscribed.")
+
+# ---------- Wire up Telegram + background threads ----------
+def build_app()->Application:
+    app=Application.builder().token(TELEGRAM_TOKEN).build()
     # commands
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
@@ -684,17 +723,49 @@ def main():
     app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
     app.add_handler(CommandHandler("logs", logs_cmd))
-
+    # approval / dangerous ops
+    app.add_handler(CommandHandler("queue", queue_cmd))
+    app.add_handler(CommandHandler("approve", approve_cmd))
+    app.add_handler(CommandHandler("deny", deny_cmd))
+    app.add_handler(CommandHandler("shell", shell_request_cmd))
+    app.add_handler(CommandHandler("py", py_request_cmd))
     # messages
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return app
+    # ---------- main ----------
+def main():
+    global GLOBAL_APP
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
+    if BACKEND=="openai" and not OPENAI_KEYS:
+        logging.warning("OpenAI backend selected but no OPENAI_API_KEY(S) provided.")
+
+    app=build_app(); GLOBAL_APP=app
 
     # background threads
     threading.Thread(target=start_health, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
 
-    logging.info("Alex mega bot starting…"); app.run_polling(close_loop=False)
+    logging.info("🚀 Alex mega bot starting…"); app.run_polling(close_loop=False)
 
-if __name__=="__main__": main()
+if __name__=="__main__":
+    main()
+
+# =========================
+# Quick env checklist:
+# TELEGRAM_TOKEN=<bot token>
+# OWNER_ID=<your telegram numeric id>
+# BACKEND=openai|ollama
+#   OPENAI_API_KEYS=key1,key2,...   (or OPENAI_API_KEY=single)
+#   OPENAI_MODEL=gpt-4o-mini
+#   OLLAMA_HOST=http://localhost:11434
+#   OLLAMA_MODEL=llama3.1:8b-instruct
+# SERPAPI_KEY=<optional>
+# HUMANE_TONE=1
+# SHORTCUT_SECRET=<something-long>  (for /shortcut endpoint)
+# USE_OPENAI_STT=0|1, USE_OPENAI_TTS=0|1, OPENAI_TTS_VOICE=alloy
+# PORT=8080
+# =========================
