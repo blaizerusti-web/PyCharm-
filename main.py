@@ -888,21 +888,22 @@ class Health(BaseHTTPRequestHandler):
             body={"answer":ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
-        class HealthHandler(BaseHTTPRequestHandler):
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-        else:
-            self.send_response(404)
-            self.end_headers()
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
 
 def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"✅ Health check server running on port {PORT}")
-    server.serve_forever()
+    server_address = ("0.0.0.0", 8080)
+    httpd = HTTPServer(server_address, HealthHandler)
+    logging.info("Health server running on port 8080")
+    httpd.serve_forever()
+
+# Run health server in a separate thread
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # Start health check server in background
 health_thread = threading.Thread(target=run_health_server, daemon=True)
