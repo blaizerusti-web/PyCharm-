@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict, Any, List
 
+# Runtime memory store
+MEM_RUNTIME = {}
 # ---------- third-party bootstrap ----------
 def _ensure(import_name: str, pip_name: str | None = None):
     """Import a package, pip-installing it if missing. Quiet & safe for Railway/Heroku."""
