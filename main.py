@@ -853,9 +853,13 @@ def tts_to_mp3(text:str)->bytes:
         logging.warning("TTS error: %s", e); return b""
 
 # ---------- Keep-alive HTTP + iOS Shortcuts webhook ----------
+
 class Health(BaseHTTPRequestHandler):
     def _ok(self, body:bytes=b"ok", code:int=200, ctype:str="text/plain"):
-        self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(body)
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         path=urlparse(self.path).path
@@ -888,22 +892,14 @@ class Health(BaseHTTPRequestHandler):
             body={"answer":ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
 
-def run_health_server():
-    server_address = ("0.0.0.0", 8080)
-    httpd = HTTPServer(server_address, HealthHandler)
-    logging.info("Health server running on port 8080")
-    httpd.serve_forever()
-
-# Run health server in a separate thread
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
+def start_health():
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), Health)
+        logging.info("Health server starting on port %s", PORT)
+        server.serve_forever()
+    except Exception as e:
+        logging.exception("Health server failed: %s", e)
 
 # Start health check server in background
 health_thread = threading.Thread(target=run_health_server, daemon=True)
