@@ -896,7 +896,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
 def run_health_server():
-    server_address = ("0.0.0.0", PORT)
+    server_address = ("0.0.0.0", 8080)
     httpd = HTTPServer(server_address, HealthHandler)
     logging.info("Health server running on port 8080")
     httpd.serve_forever()
@@ -906,6 +906,8 @@ health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
 # Start health check server in background
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # Keep main thread alive
 if __name__ == "__main__":
