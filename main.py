@@ -902,12 +902,8 @@ def run_health_server():
     httpd.serve_forever()
 
 # Run health server in a separate thread
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
 
 # Start health check server in background
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
 
 # Keep main thread alive
 if __name__ == "__main__":
@@ -1070,7 +1066,7 @@ def main():
     app=build_app(); GLOBAL_APP=app
 
     # background threads
-    threading.Thread(target=start_health, daemon=True).start()
+    threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
 
