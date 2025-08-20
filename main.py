@@ -1057,6 +1057,46 @@ def build_app()->Application:
     return app
 
 # ---------- main ----------
+
+# ---------- Ollama monitor (keeps Ollama health checked for 24/7 readiness) ----------
+def ollama_monitor(interval: int = 30):
+    """Background thread: periodically checks configured Ollama endpoints and notifies owner
+    if none are healthy while backend_mode is 'auto'. This helps keep the hybrid backend ready
+    and alerts the owner if the local/remote Ollama instances go down.
+    Minimal, non-invasive: does not change backend selection logic (AI.chat) — it only refreshes
+    the health cache and attempts an owner notification when outages happen."""
+    logging.info("Ollama monitor starting (interval=%ds)", interval)
+    while True:
+        try:
+            urls = AI.list_ollama_urls() if hasattr(AI, 'list_ollama_urls') else []
+            any_ok = False
+            for u in urls:
+                try:
+                    ok = AI._check_ollama(u, ttl=6.0)
+                except Exception:
+                    ok = False
+                any_ok = any_ok or bool(ok)
+            # If none healthy and backend is auto, warn and notify owner (best-effort)
+            if not any_ok and STATE.get("backend_mode", "auto") == "auto" and urls:
+                logging.warning("No healthy Ollama endpoints detected (checked %d urls).", len(urls))
+                # Best-effort owner notify via Telegram (if OWNER_ID set and bot running)
+                try:
+                    if OWNER_ID and OWNER_ID.isdigit() and GLOBAL_APP:
+                        cid = int(OWNER_ID)
+                        msg = ("⚠️ Ollama unreachable: no healthy endpoints. " 
+                               "Alex will fall back to OpenAI when necessary. Check your Ollama hosts.")
+                        loop = GLOBAL_APP.bot._application.loop
+                        asyncio.run_coroutine_threadsafe(GLOBAL_APP.bot.send_message(chat_id=cid, text=msg), loop)
+                except Exception:
+                    logging.exception("ollama_monitor: failed to notify owner")
+            # otherwise just sleep and check again
+            time.sleep(interval)
+        except Exception:
+            logging.exception("ollama_monitor error") 
+            time.sleep(interval)
+
+
+
 def main():
     global GLOBAL_APP
     if not TELEGRAM_TOKEN:
@@ -1068,6 +1108,7 @@ def main():
 
     # background threads
     threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=ollama_monitor, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
 
