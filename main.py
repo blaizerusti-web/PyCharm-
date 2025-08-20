@@ -9,19 +9,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict, Any, List, Tuple
 
-# --- Port fix helper ---
-def _find_free_port(start=8080, max_tries=50):
-    import socket
-    for p in range(start, start+max_tries):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(('0.0.0.0', p))
-                return p
-            except OSError:
-                continue
-    raise RuntimeError('No free port found')
-
-
 # ---------- bootstrap: install/import ----------
 def _ensure(import_name: str, pip_name: str | None = None):
     try:
@@ -901,132 +888,15 @@ class Health(BaseHTTPRequestHandler):
             body={"answer":ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
 
-def run_health_server():
-    server_address = ("0.0.0.0", 8080)
-    httpd = HTTPServer(server_address, HealthHandler)
-    logging.info("Health server running on port 8080")
-    httpd.serve_forever()
-
-# Run health server in a separate thread
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
-
-# Start health check server in background
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
-
-# Keep main thread alive
-if __name__ == "__main__":
+def start_health():
+    server_address = ("0.0.0.0", PORT)
+    httpd = HTTPServer(server_address, Health)
+    logging.info("Health server running on port %d", PORT)
     try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        print("🛑 Shutting down.")
-
-# ---------- Backend / Jarvis / Guardrails control commands ----------
-async def backend_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    if not ctx.args: return await update.message.reply_text("Usage: /backend <auto|openai|ollama>")
-    mode=ctx.args[0].strip().lower()
-    if mode not in ("auto","openai","ollama"):
-        return await update.message.reply_text("Use one of: auto | openai | ollama")
-    STATE["backend_mode"]=mode
-    AI.set_backend_mode(mode)
-    await update.message.reply_text(f"✅ Backend mode set to: {mode}")
-
-async def ollama_add_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    if not ctx.args: return await update.message.reply_text("Usage: /ollama_add <url>")
-    url=" ".join(ctx.args).strip().rstrip("/")
-    AI.add_ollama_url(url)
-    await update.message.reply_text(f"✅ Added Ollama URL: {url}")
-
-async def ollama_list_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    urls=AI.list_ollama_urls()
-    await update.message.reply_text("Ollama URLs (priority order):\n"+"\n".join(urls) if urls else "No URLs configured.")
-
-async def ollama_status_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    urls=AI.list_ollama_urls()
-    statuses=[]
-    for u in urls:
-        try:
-            r=requests.get(f"{u}/api/version", timeout=6)
-            statuses.append(f"{u} :: {r.status_code}")
-        except Exception as e:
-            statuses.append(f"{u} :: error {e}")
-    await update.message.reply_text("Ollama status:\n"+"\n".join(statuses) if statuses else "No URLs configured.")
-
-async def jarvis_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    STATE["jarvis_mode"]=True
-    await update.message.reply_text("🧠 Jarvis mode: ON")
-
-async def jarvis_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    STATE["jarvis_mode"]=False
-    await update.message.reply_text("🧠 Jarvis mode: OFF")
-
-async def trust_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    STATE["dev_mode"]=True
-    await update.message.reply_text("⚙️ Guardrails: relaxed (still safe).")
-
-async def trust_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    STATE["dev_mode"]=False
-    await update.message.reply_text("⚙️ Guardrails: standard.")
-
-async def speak_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return await update.message.reply_text("Usage: /speak <text>")
-    text=" ".join(ctx.args)
-    if not USE_OPENAI_TTS: return await update.message.reply_text("TTS disabled. Set USE_OPENAI_TTS=1.")
-    audio=tts_to_mp3(text)
-    if not audio: return await update.message.reply_text("TTS failed.")
-    path=Path("speech.mp3"); path.write_bytes(audio)
-    await update.message.reply_audio(audio=InputFile(str(path)), title="Alex says")
-
-# ---------- log path & subscription ----------
-async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    n=40
-    if ctx.args:
-        try: n=max(1,min(400,int(ctx.args[0])))
-        except: pass
-    path=MEM_RUNTIME.get("log_path") or ""
-    p=Path(path)
-    if not path or not p.exists(): return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
-    try:
-        lines=p.read_text(errors="ignore").splitlines()[-n:]
-        msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        httpd.serve_forever()
     except Exception as e:
-        logging.exception("logs read error"); await update.message.reply_text(f"Read error: {e}")
-
-async def setlog_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return await update.message.reply_text("Usage: /setlog /path/to/your.log")
-    path=" ".join(ctx.args)
-    MEM_RUNTIME["log_path"]=path
-    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
-
-async def subscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    cid=update.effective_chat.id
-    if cid not in MEM_RUNTIME["subscribers"]:
-        MEM_RUNTIME["subscribers"].append(cid)
-    await update.message.reply_text("🔔 Subscribed to live log updates.")
-
-async def unsubscribe_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    cid=update.effective_chat.id
-    if cid in MEM_RUNTIME["subscribers"]:
-        MEM_RUNTIME["subscribers"].remove(cid)
-    await update.message.reply_text("🔕 Unsubscribed.")
-
-# ---------- Wire up Telegram + background threads ----------
+        logging.error("Health server error: %s", e)
 def build_app()->Application:
     app=Application.builder().token(TELEGRAM_TOKEN).build()
     # commands
