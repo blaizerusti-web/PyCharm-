@@ -898,7 +898,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server():
     server_address = ("0.0.0.0", PORT)
     HTTPServer.allow_reuse_address = True
-    httpd = HTTPServer(server_address, HealthHandler)
+    httpd = HTTPServer(server_address, Health)
     logging.info("Health server running on port %s", PORT)
     httpd.serve_forever()
 
