@@ -763,6 +763,16 @@ def _post_to_subscribers(text:str):
     except Exception:
         pass
 
+def simple_scrape(url:str, max_chars:int=2000)->str:
+    try:
+        r=requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code!=200: return f"⚠️ HTTP {r.status_code}"
+        soup=BeautifulSoup(r.text,"html.parser")
+        text=soup.get_text(" ")[:max_chars]
+        title=soup.title.string.strip() if soup.title and soup.title.string else ""
+        return f"{title}\n\n{text}"
+    except Exception as e:
+
 TRADE_PATTERNS=[
     re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
     re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
