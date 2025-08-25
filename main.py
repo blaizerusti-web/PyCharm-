@@ -1086,6 +1086,33 @@ def run_health_server():
 health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
+# ---------- log path & subscription (make sure these exist for handlers) ----------
+async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    n = 40
+    if ctx.args:
+        try:
+            n = max(1, min(400, int(ctx.args[0])))
+        except:
+            pass
+    path = MEM_RUNTIME.get("log_path") or ""
+    p = Path(path)
+    if not path or not p.exists():
+        return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
+    try:
+        lines = p.read_text(errors="ignore").splitlines()[-n:]
+        msg = "```\n" + "\n".join(lines)[-3500:] + "\n```"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logging.exception("logs read error")
+        await update.message.reply_text(f"Read error: {e}")
+
+async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /setlog /path/to/your.log")
+    path = " ".join(ctx.args)
+    MEM_RUNTIME["log_path"] = path
+    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
+
 # ---------- Backend / Jarvis / Guardrails control ----------
 async def backend_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _owner_only(update):
@@ -1150,26 +1177,6 @@ async def trust_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("🚫 Owner only.")
     STATE["dev_mode"] = False
     await update.message.reply_text("⚙️ Guardrails: standard.")
-
-# ---------- logs viewer (needed by build_app handler) ----------
-async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    n = 40
-    if ctx.args:
-        try:
-            n = max(1, min(400, int(ctx.args[0])))
-        except:
-            pass
-    path = MEM_RUNTIME.get("log_path") or ""
-    p = Path(path)
-    if not path or not p.exists():
-        return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
-    try:
-        lines = p.read_text(errors="ignore").splitlines()[-n:]
-        msg = "```\n" + "\n".join(lines)[-3500:] + "\n```"
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        logging.exception("logs read error")
-        await update.message.reply_text(f"Read error: {e}")
 
 # ---------- Build + Run App ----------
 def build_app() -> Application:
