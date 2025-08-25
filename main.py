@@ -771,7 +771,8 @@ def simple_scrape(url:str, max_chars:int=2000)->str:
         text=soup.get_text(" ")[:max_chars]
         title=soup.title.string.strip() if soup.title and soup.title.string else ""
         return f"{title}\n\n{text}"
-    except Exception as e:
+    except SomeError as e:
+    print(f"Error in trading log parser: {e}")
 
 TRADE_PATTERNS=[
     re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
