@@ -1113,6 +1113,18 @@ async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     MEM_RUNTIME["log_path"] = path
     await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
 
+# ---------- live log subscription handlers ----------
+async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid not in MEM_RUNTIME["subscribers"]:
+        MEM_RUNTIME["subscribers"].append(cid)
+    await update.message.reply_text("🔔 Subscribed to live log updates.")
+
+async def unsubscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid in MEM_RUNTIME["subscribers"]:
+        MEM_RUNTIME["subscribers"].remove(cid)
+    await update.message.reply_text("🔕 Unsubscribed from live log updates.")
 # ---------- Backend / Jarvis / Guardrails control ----------
 async def backend_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _owner_only(update):
