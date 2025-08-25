@@ -1066,7 +1066,7 @@ class Health(BaseHTTPRequestHandler):
             body = {"answer": ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
-        # ---------- Secondary Health Handler for keep-alive ----------
+# ---------- Secondary Health Handler for keep-alive ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -1085,6 +1085,17 @@ def run_health_server():
 # Run health server in a separate thread
 health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
+
+# ---------- Safety: define setlog_cmd here if missing ----------
+if "setlog_cmd" not in globals():
+    async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        if not ctx.args:
+            return await update.message.reply_text("Usage: /setlog /path/to/your.log")
+        path = " ".join(ctx.args)
+        MEM_RUNTIME["log_path"] = path
+        await update.message.reply_text(
+            f"✅ Log path set to: `{path}`", parse_mode="Markdown"
+        )
 
 # ---------- Backend / Jarvis / Guardrails control ----------
 async def backend_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
