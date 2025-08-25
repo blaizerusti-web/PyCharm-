@@ -1074,7 +1074,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
 
-
 def run_health_server():
     # Use dynamic port if provided (important for deployment environments like Render/Heroku)
     port = int(os.getenv("PORT", PORT))
@@ -1083,11 +1082,93 @@ def run_health_server():
     logging.info(f"Health server running on port {port}")
     httpd.serve_forever()
 
+# NOTE: Do NOT start a thread here. `main()` starts it once.
+# (Starting it twice caused "Address already in use" earlier.)
 
-# Run health server in a separate thread
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
+# ---------- Log path & subscription commands (were missing) ----------
+async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /setlog /path/to/your.log")
+    path = " ".join(ctx.args)
+    MEM_RUNTIME["log_path"] = path
+    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
 
+async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid not in MEM_RUNTIME["subscribers"]:
+        MEM_RUNTIME["subscribers"].append(cid)
+    await update.message.reply_text("🔔 Subscribed to live log updates.")
+
+async def unsubscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid in MEM_RUNTIME["subscribers"]:
+        MEM_RUNTIME["subscribers"].remove(cid)
+    await update.message.reply_text("🔕 Unsubscribed.")
+
+# ---------- Backend / Jarvis / Guardrails control ----------
+async def backend_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /backend <auto|openai|ollama>")
+    mode = ctx.args[0].strip().lower()
+    if mode not in ("auto", "openai", "ollama"):
+        return await update.message.reply_text("Use one of: auto | openai | ollama")
+    STATE["backend_mode"] = mode
+    AI.set_backend_mode(mode)
+    await update.message.reply_text(f"✅ Backend mode set to: {mode}")
+
+async def ollama_add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /ollama_add <url>")
+    url = " ".join(ctx.args).strip().rstrip("/")
+    AI.add_ollama_url(url)
+    await update.message.reply_text(f"✅ Added Ollama URL: {url}")
+
+async def ollama_list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    urls = AI.list_ollama_urls()
+    await update.message.reply_text(
+        "Ollama URLs (priority order):\n" + "\n".join(urls) if urls else "No URLs configured."
+    )
+
+async def ollama_status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    urls = AI.list_ollama_urls()
+    statuses = []
+    for u in urls:
+        try:
+            r = requests.get(f"{u}/api/version", timeout=6)
+            statuses.append(f"{u} :: {r.status_code}")
+        except Exception as e:
+            statuses.append(f"{u} :: error {e}")
+    await update.message.reply_text(
+        "Ollama status:\n" + "\n".join(statuses) if statuses else "No URLs configured."
+    )
+
+async def jarvis_on_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    STATE["jarvis_mode"] = True
+    await update.message.reply_text("🧠 Jarvis mode: ON")
+
+async def jarvis_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    STATE["jarvis_mode"] = False
+    await update.message.reply_text("🧠 Jarvis mode: OFF")
+
+async def trust_on_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    STATE["dev_mode"] = True
+    await update.message.reply_text("⚙️ Guardrails: relaxed (still safe).")
+
+async def trust_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    STATE["dev_mode"] = False
+    await update.message.reply_text("⚙️ Guardrails: standard.")
 
 # ---------- Build + Run App ----------
 def build_app() -> Application:
@@ -1108,11 +1189,11 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("exportmem", exportmem_cmd))
     app.add_handler(CommandHandler("raw", raw_cmd))
     app.add_handler(CommandHandler("setlog", setlog_cmd))
-    app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))      # ✅ fixed
-    app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))  # ✅ fixed
+    app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))
+    app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
     app.add_handler(CommandHandler("logs", logs_cmd))
 
-    # Backend / Jarvis / Guardrails
+    # Backend/Jarvis/Trust
     app.add_handler(CommandHandler("backend", backend_cmd))
     app.add_handler(CommandHandler("ollama_add", ollama_add_cmd))
     app.add_handler(CommandHandler("ollama_list", ollama_list_cmd))
@@ -1123,7 +1204,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("trust_off", trust_off_cmd))
     app.add_handler(CommandHandler("speak", speak_cmd))
 
-    # Dangerous ops (owner-gated)
+    # Dangerous ops
     app.add_handler(CommandHandler("queue", queue_cmd))
     app.add_handler(CommandHandler("approve", approve_cmd))
     app.add_handler(CommandHandler("deny", deny_cmd))
@@ -1136,7 +1217,6 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
-
 def main():
     global GLOBAL_APP
     if not TELEGRAM_TOKEN:
@@ -1145,21 +1225,17 @@ def main():
     if AI.backend_mode in ("auto", "openai") and not OPENAI_KEYS:
         logging.warning("OpenAI path may be used but no OPENAI_API_KEY(S) provided.")
 
-    app = build_app()
-    GLOBAL_APP = app
+    app = build_app(); GLOBAL_APP = app
 
-    # Background threads
+    # Background threads — start health server ONLY here (single instance)
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
 
     logging.info("🚀 Alex mega bot starting…")
-    logging.info(
-        "Jarvis=%s | DevMode=%s | Backend=%s | OllamaURLs=%s",
-        STATE["jarvis_mode"], STATE["dev_mode"], STATE["backend_mode"], AI.list_ollama_urls()
-    )
+    logging.info("Jarvis=%s | DevMode=%s | Backend=%s | OllamaURLs=%s",
+                 STATE['jarvis_mode'], STATE['dev_mode'], STATE['backend_mode'], AI.list_ollama_urls())
     app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()
@@ -1176,6 +1252,6 @@ if __name__ == "__main__":
 # SERPAPI_KEY=<optional>
 # HUMANE_TONE=1
 # SHORTCUT_SECRET=<something-long>  (for /shortcut endpoint)
-# USE_OPENAI_STT=0|1
+# USE_OPENAI_STT=0|1,
 # USE_OPENAI_TTS=0|1
 # OPENAI_TTS_VOICE=alloy
