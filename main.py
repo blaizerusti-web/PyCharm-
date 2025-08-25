@@ -1082,28 +1082,9 @@ def run_health_server():
     logging.info(f"Health server running on port {port}")
     httpd.serve_forever()
 
-# NOTE: Do NOT start a thread here. `main()` starts it once.
-# (Starting it twice caused "Address already in use" earlier.)
-
-# ---------- Log path & subscription commands (were missing) ----------
-async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Usage: /setlog /path/to/your.log")
-    path = " ".join(ctx.args)
-    MEM_RUNTIME["log_path"] = path
-    await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
-
-async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid not in MEM_RUNTIME["subscribers"]:
-        MEM_RUNTIME["subscribers"].append(cid)
-    await update.message.reply_text("🔔 Subscribed to live log updates.")
-
-async def unsubscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cid = update.effective_chat.id
-    if cid in MEM_RUNTIME["subscribers"]:
-        MEM_RUNTIME["subscribers"].remove(cid)
-    await update.message.reply_text("🔕 Unsubscribed.")
+# Run health server in a separate thread
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # ---------- Backend / Jarvis / Guardrails control ----------
 async def backend_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1130,7 +1111,7 @@ async def ollama_add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ollama_list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     urls = AI.list_ollama_urls()
     await update.message.reply_text(
-        "Ollama URLs (priority order):\n" + "\n".join(urls) if urls else "No URLs configured."
+        "Ollama URLs (priority order):\n" + ("\n".join(urls) if urls else "No URLs configured.")
     )
 
 async def ollama_status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1143,7 +1124,7 @@ async def ollama_status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             statuses.append(f"{u} :: error {e}")
     await update.message.reply_text(
-        "Ollama status:\n" + "\n".join(statuses) if statuses else "No URLs configured."
+        "Ollama status:\n" + ("\n".join(statuses) if statuses else "No URLs configured.")
     )
 
 async def jarvis_on_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1169,6 +1150,26 @@ async def trust_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("🚫 Owner only.")
     STATE["dev_mode"] = False
     await update.message.reply_text("⚙️ Guardrails: standard.")
+
+# ---------- logs viewer (needed by build_app handler) ----------
+async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    n = 40
+    if ctx.args:
+        try:
+            n = max(1, min(400, int(ctx.args[0])))
+        except:
+            pass
+    path = MEM_RUNTIME.get("log_path") or ""
+    p = Path(path)
+    if not path or not p.exists():
+        return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
+    try:
+        lines = p.read_text(errors="ignore").splitlines()[-n:]
+        msg = "```\n" + "\n".join(lines)[-3500:] + "\n```"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logging.exception("logs read error")
+        await update.message.reply_text(f"Read error: {e}")
 
 # ---------- Build + Run App ----------
 def build_app() -> Application:
@@ -1227,7 +1228,7 @@ def main():
 
     app = build_app(); GLOBAL_APP = app
 
-    # Background threads — start health server ONLY here (single instance)
+    # Background threads
     threading.Thread(target=run_health_server, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
