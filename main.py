@@ -1066,27 +1066,38 @@ class Health(BaseHTTPRequestHandler):
             body = {"answer": ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
-# ---------- Secondary Health Handler for keep-alive ----------
+# ---------- Health endpoint (idempotent) ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
+        if self.path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        elif self.path == "/ollama_status":
+            status = {"mode": STATE.get("backend_mode"), "urls": AI.list_ollama_urls()}
+            body = json.dumps(status).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"not found")
 
 def run_health_server():
-    # Use dynamic port if provided (important for deployment environments like Render/Heroku)
     port = int(os.getenv("PORT", PORT))
-    server_address = ("0.0.0.0", port)
-    httpd = HTTPServer(server_address, HealthHandler)
+    httpd = HTTPServer(("0.0.0.0", port), HealthHandler)
     logging.info(f"Health server running on port {port}")
     httpd.serve_forever()
 
-# Run health server in a separate thread
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
+# start once only (avoid Address already in use)
+if not globals().get("HEALTH_STARTED", False):
+    threading.Thread(target=run_health_server, daemon=True).start()
+    HEALTH_STARTED = True
 
-# ---------- log path & subscription (make sure these exist for handlers) ----------
+# ---------- Log path & subscription (safe re-definitions) ----------
 async def logs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = 40
     if ctx.args:
@@ -1113,7 +1124,6 @@ async def setlog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     MEM_RUNTIME["log_path"] = path
     await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
 
-# ---------- live log subscription handlers ----------
 async def subscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid not in MEM_RUNTIME["subscribers"]:
@@ -1124,7 +1134,26 @@ async def unsubscribe_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     if cid in MEM_RUNTIME["subscribers"]:
         MEM_RUNTIME["subscribers"].remove(cid)
-    await update.message.reply_text("🔕 Unsubscribed from live log updates.")
+    await update.message.reply_text("🔕 Unsubscribed.")
+
+# ---------- Speak (TTS) ----------
+async def speak_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /speak <text>")
+    if not USE_OPENAI_TTS:
+        return await update.message.reply_text("TTS disabled. Set USE_OPENAI_TTS=1.")
+    text = " ".join(ctx.args).strip()
+    try:
+        audio = tts_to_mp3(text)
+        if not audio:
+            return await update.message.reply_text("TTS failed.")
+        path = Path("speech.mp3")
+        path.write_bytes(audio)
+        await update.message.reply_audio(audio=InputFile(str(path)), title="Alex says")
+    except Exception as e:
+        logging.exception("speak_cmd error")
+        await update.message.reply_text(f"TTS error: {e}")
+
 # ---------- Backend / Jarvis / Guardrails control ----------
 async def backend_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _owner_only(update):
@@ -1150,7 +1179,7 @@ async def ollama_add_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ollama_list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     urls = AI.list_ollama_urls()
     await update.message.reply_text(
-        "Ollama URLs (priority order):\n" + ("\n".join(urls) if urls else "No URLs configured.")
+        "Ollama URLs (priority order):\n" + "\n".join(urls) if urls else "No URLs configured."
     )
 
 async def ollama_status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1163,7 +1192,7 @@ async def ollama_status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             statuses.append(f"{u} :: error {e}")
     await update.message.reply_text(
-        "Ollama status:\n" + ("\n".join(statuses) if statuses else "No URLs configured.")
+        "Ollama status:\n" + "\n".join(statuses) if statuses else "No URLs configured."
     )
 
 async def jarvis_on_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1208,12 +1237,14 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("mem", mem_cmd))
     app.add_handler(CommandHandler("exportmem", exportmem_cmd))
     app.add_handler(CommandHandler("raw", raw_cmd))
+
+    # Logs & subscriptions
     app.add_handler(CommandHandler("setlog", setlog_cmd))
+    app.add_handler(CommandHandler("logs", logs_cmd))
     app.add_handler(CommandHandler("subscribe_logs", subscribe_cmd))
     app.add_handler(CommandHandler("unsubscribe_logs", unsubscribe_cmd))
-    app.add_handler(CommandHandler("logs", logs_cmd))
 
-    # Backend/Jarvis/Trust
+    # Backend / Jarvis / Guardrails
     app.add_handler(CommandHandler("backend", backend_cmd))
     app.add_handler(CommandHandler("ollama_add", ollama_add_cmd))
     app.add_handler(CommandHandler("ollama_list", ollama_list_cmd))
@@ -1222,6 +1253,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("jarvis_off", jarvis_off_cmd))
     app.add_handler(CommandHandler("trust_on", trust_on_cmd))
     app.add_handler(CommandHandler("trust_off", trust_off_cmd))
+
+    # TTS
     app.add_handler(CommandHandler("speak", speak_cmd))
 
     # Dangerous ops
@@ -1247,14 +1280,15 @@ def main():
 
     app = build_app(); GLOBAL_APP = app
 
-    # Background threads
-    threading.Thread(target=run_health_server, daemon=True).start()
+    # Background threads (idempotent health already started above)
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
 
     logging.info("🚀 Alex mega bot starting…")
-    logging.info("Jarvis=%s | DevMode=%s | Backend=%s | OllamaURLs=%s",
-                 STATE['jarvis_mode'], STATE['dev_mode'], STATE['backend_mode'], AI.list_ollama_urls())
+    logging.info(
+        "Jarvis=%s | DevMode=%s | Backend=%s | OllamaURLs=%s",
+        STATE['jarvis_mode'], STATE['dev_mode'], STATE['backend_mode'], AI.list_ollama_urls()
+    )
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
@@ -1271,7 +1305,7 @@ if __name__ == "__main__":
 #   OLLAMA_MODEL=llama3.1:8b-instruct
 # SERPAPI_KEY=<optional>
 # HUMANE_TONE=1
-# SHORTCUT_SECRET=<something-long>  (for /shortcut endpoint)
-# USE_OPENAI_STT=0|1,
+# SHORTCUT_SECRET=<secret for /shortcut>
+# USE_OPENAI_STT=0|1
 # USE_OPENAI_TTS=0|1
 # OPENAI_TTS_VOICE=alloy
