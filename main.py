@@ -46,8 +46,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN","").strip()
 OWNER_ID=os.getenv("OWNER_ID","").strip()   # your Telegram numeric user id
 
-# Server / ports
-PORT=int(os.getenv("PORT","8080"))
+# Server / ports (robust: accept PORT or Heroku-style lowercase 'port')
+PORT=int(os.getenv("PORT") or os.getenv("port") or 8080)
 
 # Third-party APIs
 SERPAPI_KEY=os.getenv("SERPAPI_KEY","").strip()
@@ -69,17 +69,16 @@ OPENAI_KEYS=[k.strip() for k in os.getenv("OPENAI_API_KEYS","").split(",") if k.
 if not OPENAI_KEYS and os.getenv("OPENAI_API_KEY","").strip():
     OPENAI_KEYS=[os.getenv("OPENAI_API_KEY","").strip()]
 
-# Ollama hybrid (Option 2)
-# List of candidate endpoints; first healthy is used.
+# Ollama hybrid (Option 2 foundations for 24/7)
+# Multiple candidate endpoints; first healthy is used.
 # Examples:
 #   OLLAMA_URLS="https://abc-123.ngrok.app,http://100.100.100.10:11434,http://localhost:11434"
 OLLAMA_URLS=[u.strip().rstrip("/") for u in os.getenv("OLLAMA_URLS","").split(",") if u.strip()]
-# Back-compat:
+# Back-compat single host:
 if not OLLAMA_URLS:
     host=os.getenv("OLLAMA_HOST","http://localhost:11434").strip().rstrip("/")
     if host: OLLAMA_URLS=[host]
 OLLAMA_MODEL=os.getenv("OLLAMA_MODEL","llama3.1:8b-instruct").strip()
-
 # iOS Shortcuts webhook
 SHORTCUT_SECRET=os.getenv("SHORTCUT_SECRET","").strip()
 
@@ -164,8 +163,7 @@ class AIBackend:
             if self._check_ollama(u):
                 return u
         return None
-
-    # ----- chat paths -----
+            # ----- chat paths -----
     def _ollama_chat(self, messages:List[Dict[str,Any]], model:str|None, timeout:float=60.0)->str:
         url=self._select_ollama()
         if not url:
@@ -179,10 +177,10 @@ class AIBackend:
                 return (j["message"].get("content","") or "").strip()
             if "response" in j:
                 return (j["response"] or "").strip()
-        return "â ï¸ Ollama: unexpected response."
+        return "⚠️ Ollama: unexpected response."
 
     def _openai_chat(self, messages:List[Dict[str,Any]], model:str|None, max_tokens:int=800, timeout:float=60.0)->str:
-        if not OPENAI_KEYS: return "â ï¸ OPENAI_API_KEY(S) not set."
+        if not OPENAI_KEYS: return "⚠️ OPENAI_API_KEY(S) not set."
         attempts=max(3, len(OPENAI_KEYS)); base_sleep=1.1
         last_error=None
         for i in range(attempts):
@@ -197,7 +195,7 @@ class AIBackend:
                     r=self._old_sdk.ChatCompletion.create(model=model or self.openai_model, messages=messages, max_tokens=max_tokens, request_timeout=timeout)
                     return r["choices"][0]["message"]["content"].strip()
                 else:
-                    return "â ï¸ OpenAI SDK not available."
+                    return "⚠️ OpenAI SDK not available."
             except Exception as e:
                 last_error=e
                 msg=str(e).lower()
@@ -207,7 +205,7 @@ class AIBackend:
                     time.sleep(base_sleep*(2**i)+random.random()*0.4)
                     continue
                 break
-        return f"â ï¸ OpenAI error: {last_error}"
+        return f"⚠️ OpenAI error: {last_error}"
 
     def chat(self, messages:List[Dict[str,Any]], model:str|None=None, max_tokens:int=800, timeout:float=60.0)->str:
         mode=self.backend_mode
@@ -216,7 +214,7 @@ class AIBackend:
                 return self._ollama_chat(messages, model, timeout=timeout)
             except Exception as e:
                 logging.error("Ollama error: %s", e)
-                return f"â ï¸ Ollama error: {e}"
+                return f"⚠️ Ollama error: {e}"
         elif mode=="openai":
             return self._openai_chat(messages, model, max_tokens=max_tokens, timeout=timeout)
         else:  # auto (hybrid)
@@ -243,17 +241,16 @@ def _owner_only(update:Update)->bool:
     return OWNER_ID and str(update.effective_user.id)==str(OWNER_ID)
 
 def persona_prompt()->str:
-    base = "You are Alex â concise, helpful, witty, and practical."
+    base = "You are Alex — concise, helpful, witty, and practical."
     if STATE["jarvis_mode"]:
-        base = ("You are Alex (aka Jarvis) â proactive, succinct, voice-friendly. "
+        base = ("You are Alex (aka Jarvis) — proactive, succinct, voice-friendly. "
                 "Offer smart defaults, anticipate needs, and keep answers tight.")
     if STATE["dev_mode"]:
         base += " Be direct and unblocked, but stay safe and lawful."
     if HUMANE_TONE:
         base += " Prefer short sentences and humane summaries."
     return base
-
-async def ask_ai(prompt:str, context:str="")->str:
+    async def ask_ai(prompt:str, context:str="")->str:
     sysmsg=context or persona_prompt()
     try:
         return AI.chat(
@@ -263,30 +260,34 @@ async def ask_ai(prompt:str, context:str="")->str:
         )
     except Exception as e:
         logging.exception("ask_ai error")
-        return f"â ï¸ AI error: {e}"
-        # ---------- SQLite memory ----------
+        return f"⚠️ AI error: {e}"
+
+# ---------- SQLite memory ----------
 DB_PATH="alex_memory.db"
 conn=sqlite3.connect(DB_PATH, check_same_thread=False)
 cur=conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS raw_events(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, type TEXT NOT NULL, text TEXT NOT NULL, meta TEXT)""" )
-cur.execute("""CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_events(ts)""" )
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, type TEXT NOT NULL, text TEXT NOT NULL, meta TEXT)""")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_raw_ts ON raw_events(ts)")
 cur.execute("""CREATE TABLE IF NOT EXISTS notes(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, source TEXT NOT NULL, topic_key TEXT NOT NULL,
-  title TEXT, content TEXT NOT NULL, tags TEXT, sentiment TEXT, raw_ref TEXT)""" )
-cur.execute("""CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)""" )
+  title TEXT, content TEXT NOT NULL, tags TEXT, sentiment TEXT, raw_ref TEXT)""")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)")
 conn.commit()
 
 RAW_JSONL=Path("raw_events.jsonl")
+
 def _append_jsonl(obj:dict):
     try:
-        with RAW_JSONL.open("a", encoding="utf-8") as f: f.write(json.dumps(obj, ensure_ascii=False)+"\n")
-    except Exception as e: logging.error("JSONL append error: %s", e)
+        with RAW_JSONL.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False)+"\n")
+    except Exception as e:
+        logging.error("JSONL append error: %s", e)
 
 def log_raw(ev_type:str, text:str, meta:dict|None=None)->int:
     ts=datetime.utcnow().isoformat()
     m=json.dumps(meta or {}, ensure_ascii=False)
-cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m))
+    cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m))
     conn.commit()
     rid=cur.lastrowid
     _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
@@ -311,12 +312,15 @@ def _merge_contents(old:str, new:str)->str:
 
 def _humane_summarize(text:str, capture_tone:bool=True)->dict:
     sysmsg="Compress into human memory: 3–6 bullets or 2–4 short sentences; essentials only."
-    if capture_tone and HUMANE_TONE: sysmsg+=" Detect tone (positive/neutral/negative + brief)."
+    if capture_tone and HUMANE_TONE:
+        sysmsg+=" Detect tone (positive/neutral/negative + brief)."
     prompt=f"Digest this into humane memory.\n\nTEXT:\n{text}\n\nReturn JSON: title, summary, tags (3-6), sentiment."
     try:
         out=AI.chat([{"role":"system","content":sysmsg},{"role":"user","content":prompt}], max_tokens=360)
-        try: data=json.loads(out)
-        except Exception: data={"title":"","summary":out.strip(),"tags":"","sentiment":""}
+        try:
+            data=json.loads(out)
+        except Exception:
+            data={"title":"","summary":out.strip(),"tags":"","sentiment":""}
         return {"title":(data.get("title") or "")[:120],
                 "summary":(data.get("summary") or out).strip(),
                 "tags":(data.get("tags") or "").replace("\n"," ").strip(),
@@ -332,28 +336,36 @@ def remember(source:str, text:str, raw_ref:str="")->int:
     if row:
         nid, existing=row
         merged=_merge_contents(existing, digest["summary"])
-        cur.execute("""UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=?,raw_ref=? WHERE id=?""" ,
+        cur.execute("""UPDATE notes SET ts=?,source=?,title=?,content=?,tags=?,sentiment=?,raw_ref=? WHERE id=?""",
                     (datetime.utcnow().isoformat(),source,digest["title"],merged,digest["tags"],digest["sentiment"],raw_ref,nid))
         conn.commit()
         return nid
     cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
-                   VALUES(?,?,?,?,?,?,?,?)""" ,
+                   VALUES(?,?,?,?,?,?,?,?)""",
                 (datetime.utcnow().isoformat(),source,topic,digest["title"],digest["summary"],digest["tags"],digest["sentiment"],raw_ref))
     conn.commit()
     return cur.lastrowid
 
 # ---------- simple lexical search ----------
 _WORD_RE=re.compile(r"[a-z0-9]+")
-def _tokenize(s:str)->List[str]: return _WORD_RE.findall(s.lower())
+def _tokenize(s:str)->List[str]:
+    return _WORD_RE.findall(s.lower())
+
 def _tf(tokens:List[str])->Dict[str,float]:
     d={}; n=float(len(tokens)) or 1.0
-    for t in tokens: d[t]=d.get(t,0)+1.0
-    for k in d: d[k]/=n
+    for t in tokens:
+        d[t]=d.get(t,0)+1.0
+    for k in d:
+        d[k]/=n
     return d
+
 def _cosine(a:Dict[str,float], b:Dict[str,float])->float:
-    if not a or not b: return 0.0
-    common=set(a)&set(b); num=sum(a[t]*b[t] for t in common)
-    da=math.sqrt(sum(v*v for v in a.values())); db=math.sqrt(sum(v*v for v in b.values()))
+    if not a or not b:
+        return 0.0
+    common=set(a)&set(b)
+    num=sum(a[t]*b[t] for t in common)
+    da=math.sqrt(sum(v*v for v in a.values()))
+    db=math.sqrt(sum(v*v for v in b.values()))
     return 0.0 if da==0 or db==0 else num/(da*db)
 
 def search_memory(query:str, k_raw:int=12, k_notes:int=12)->dict:
@@ -361,8 +373,10 @@ def search_memory(query:str, k_raw:int=12, k_notes:int=12)->dict:
     cur.execute("SELECT id,ts,type,text,meta FROM raw_events ORDER BY id DESC LIMIT 4000")
     raw_scored=[]
     for r in cur.fetchall():
-        txt=r[3] or ""; score=_cosine(qtf,_tf(_tokenize(txt)))
-        if score>0: raw_scored.append((score,{"id":r[0],"ts":r[1],"type":r[2],"text":txt,"meta":r[4]}))
+        txt=r[3] or ""
+        score=_cosine(qtf,_tf(_tokenize(txt)))
+        if score>0:
+            raw_scored.append((score,{"id":r[0],"ts":r[1],"type":r[2],"text":txt,"meta":r[4]}))
     raw_top=[x[1] for x in sorted(raw_scored,key=lambda z:z[0],reverse=True)[:k_raw]]
 
     cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id DESC LIMIT 4000")
@@ -371,7 +385,8 @@ def search_memory(query:str, k_raw:int=12, k_notes:int=12)->dict:
         txt=(r[4] or "")+" "+(r[3] or "")+" "+(r[5] or "")
         score=_cosine(qtf,_tf(_tokenize(txt)))
         if score>0:
-            note_scored.append((score,{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4] or "",
+            note_scored.append((score,{"id":r[0],"ts":r[1],"source":r[2],
+                                       "title":r[3] or "","content":r[4] or "",
                                        "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""}))
     notes_top=[x[1] for x in sorted(note_scored,key=lambda z:z[0],reverse=True)[:k_notes]]
     return {"raw":raw_top,"notes":notes_top}
@@ -380,10 +395,12 @@ def build_context_blurb(found:dict, max_chars:int=3800)->str:
     parts=[]
     for n in found.get("notes",[]):
         blk=f"[NOTE #{n['id']} | {n['ts']} | {n['source']} | {n['title']}] {n['content']}"
-        if n["tags"]: blk+=f" (tags: {n['tags']})"
+        if n["tags"]:
+            blk+=f" (tags: {n['tags']})"
         parts.append(blk)
     for r in found.get("raw",[]):
-        txt=r["text"]; txt=txt[:600]+"…" if len(txt)>600 else txt
+        txt=r["text"]
+        txt=txt[:600]+"…" if len(txt)>600 else txt
         parts.append(f"[RAW #{r['id']} | {r['ts']} | {r['type']}] {txt}")
     return "\n\n".join(parts)[:max_chars]
 
@@ -408,37 +425,46 @@ async def fetch_url(url:str)->str:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=25, headers={"User-Agent":"Mozilla/5.0"}) as r:
-                if r.status!=200: return f"⚠️ HTTP {r.status}"
+                if r.status!=200:
+                    return f"⚠️ HTTP {r.status}"
                 text=await r.text()
         soup=BeautifulSoup(text,"html.parser")
         title=soup.title.string.strip() if soup.title and soup.title.string else "No title"
         desc=(soup.find("meta",{"name":"description"}) or {}).get("content","")
         h1=soup.h1.get_text(strip=True) if soup.h1 else ""
-        words=len(soup.get_text(' ').split()); links=len(soup.find_all("a")); images=len(soup.find_all("img"))
+        words=len(soup.get_text(' ').split())
+        links=len(soup.find_all("a"))
+        images=len(soup.find_all("img"))
         snippet=soup.get_text(" ")[:1800]
         return f"🌐 {title}\nDesc: {desc[:200]}\nH1: {h1}\nWords:{words} Links:{links} Images:{images}\n\nSnippet:\n{snippet}"
     except Exception as e:
-        logging.exception("Crawl error"); return f"⚠️ Crawl error: {e}"
+        logging.exception("Crawl error")
+        return f"⚠️ Crawl error: {e}"
 
 async def analyze_url(url:str)->str:
     content=await fetch_url(url)
-    if content.startswith("⚠️"): return content
+    if content.startswith("⚠️"):
+        return content
     summary=await ask_ai("Summarize page in short bullets; key entities, actions, SEO opportunities:\n\n"+content)
-    log_raw("link", summary, {"url":url}); remember("link", summary, raw_ref=url); return summary
+    log_raw("link", summary, {"url":url})
+    remember("link", summary, raw_ref=url)
+    return summary
 
 # ---------- File analyzers ----------
 def analyze_excel(path:Path)->str:
     try:
         df=pd.read_excel(path)
-head=", ".join(map(str,list(df.columns)[:12]))
+        head=", ".join(map(str,list(df.columns)[:12]))
         info=f"✅ Excel loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head}"
         num=df.select_dtypes(include="number")
-        if not num.empty: info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
+        if not num.empty:
+            info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
         log_raw("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file":str(path)})
         remember("file", f"Excel {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
         return info
     except Exception as e:
-        logging.exception("Excel analysis error"); return f"⚠️ Excel analysis error: {e}"
+        logging.exception("Excel analysis error")
+        return f"⚠️ Excel analysis error: {e}"
 
 def analyze_csv(path:Path)->str:
     try:
@@ -446,37 +472,45 @@ def analyze_csv(path:Path)->str:
         head=", ".join(map(str,list(df.columns)[:12]))
         info=f"✅ CSV loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head}"
         num=df.select_dtypes(include="number")
-        if not num.empty: info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
+        if not num.empty:
+            info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
         log_raw("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", {"file":str(path)})
         remember("file", f"CSV {path.name}: shape {df.shape}; columns {list(df.columns)!r}", raw_ref=str(path))
         return info
     except Exception as e:
-        logging.exception("CSV analysis error"); return f"⚠️ CSV analysis error: {e}"
+        logging.exception("CSV analysis error")
+        return f"⚠️ CSV analysis error: {e}"
 
 def analyze_json(path:Path)->str:
     try:
         raw=path.read_text(encoding="utf-8", errors="ignore")
         data=json.loads(raw)
         if isinstance(data,list):
-            shape=f"list[{len(data)}]"; preview=json.dumps(data[:3], ensure_ascii=False)[:1500]
+            shape=f"list[{len(data)}]"
+            preview=json.dumps(data[:3], ensure_ascii=False)[:1500]
         elif isinstance(data,dict):
-            shape=f"dict({len(data.keys())} keys)"; preview=json.dumps({k:data[k] for k in list(data.keys())[:10]}, ensure_ascii=False)[:1500]
+            shape=f"dict({len(data.keys())} keys)"
+            preview=json.dumps({k:data[k] for k in list(data.keys())[:10]}, ensure_ascii=False)[:1500]
         else:
-            shape=type(data).__name__; preview=str(data)[:1500]
+            shape=type(data).__name__
+            preview=str(data)[:1500]
         info=f"✅ JSON loaded: {shape}\nPreview: {preview}"
         log_raw("file", f"JSON {path.name}: shape {shape}", {"file":str(path)})
         remember("file", f"JSON {path.name}: shape {shape}\nPreview: {preview}", raw_ref=str(path))
         return info
     except Exception as e:
-        logging.exception("JSON analysis error"); return f"⚠️ JSON analysis error: {e}"
+        logging.exception("JSON analysis error")
+        return f"⚠️ JSON analysis error: {e}"
 
 # ---------- Image analyzer (EXIF + optional OCR) ----------
 def _exif_dict(im:Image.Image)->dict:
     try:
-        exif=im._getexif() or {}; label={ExifTags.TAGS.get(k,k):v for k,v in exif.items()}
+        exif=im._getexif() or {}
+        label={ExifTags.TAGS.get(k,k):v for k,v in exif.items()}
         keep={}
         for k in ["DateTime","Make","Model","Software","LensModel","Orientation","ExifVersion","XResolution","YResolution"]:
-            if k in label: keep[k]=label[k]
+            if k in label:
+                keep[k]=label[k]
         return keep
     except Exception:
         return {}
@@ -484,7 +518,9 @@ def _exif_dict(im:Image.Image)->dict:
 def analyze_image(path:Path)->str:
     meta={"file":str(path)}
     try:
-        im=Image.open(path); exif=_exif_dict(im); meta["exif"]=exif
+        im=Image.open(path)
+        exif=_exif_dict(im)
+        meta["exif"]=exif
         if HAS_TESS:
             try:
                 import pytesseract
@@ -499,19 +535,26 @@ def analyze_image(path:Path)->str:
         return f"🖼️ Image saved. EXIF keys: {list(exif.keys()) if exif else 'none'}. OCR length: {len(ocr)} chars. (raw id {rid})"
     except Exception as e:
         log_raw("image", f"Image load error {path.name}: {e}", {"file": str(path)})
-        logging.exception("Image analysis error"); return f"⚠️ Image analysis error: {e}"
-
-# ---------- SERP (optional) ----------
+        logging.exception("Image analysis error")
+        return f"⚠️ Image analysis error: {e}"
+        # ---------- SERP (optional) ----------
 def serp_search_snippet(query:str)->str:
-    if not SERPAPI_KEY: return "⚠️ SERPAPI_KEY not set."
+    if not SERPAPI_KEY:
+        return "⚠️ SERPAPI_KEY not set."
     try:
-        r=requests.get("https://serpapi.com/search", params={"q":query,"hl":"en","api_key":SERPAPI_KEY}, timeout=25)
+        r=requests.get(
+            "https://serpapi.com/search",
+            params={"q":query,"hl":"en","api_key":SERPAPI_KEY},
+            timeout=25
+        )
         j=r.json()
         snip=j.get("organic_results",[{}])[0].get("snippet","(no results)")
         return f"🔎 {query}\n{snip}"
     except Exception as e:
-        logging.exception("Search error"); return f"Search error: {e}"
-        # ---------- Telegram handlers ----------
+        logging.exception("Search error")
+        return f"Search error: {e}"
+
+# ---------- Telegram handlers ----------
 async def start_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hey, I'm Alex 🤖 (hybrid brain: Ollama→OpenAI fallback)\n"
@@ -534,39 +577,59 @@ async def uptime_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏱️ Uptime {h}h {m}m {s}s")
 
 async def config_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    flags={"BACKEND_MODE":STATE["backend_mode"],"OPENAI_MODEL":OPENAI_MODEL,"OLLAMA_MODEL":OLLAMA_MODEL,"HUMANE_TONE":HUMANE_TONE,
-           "HAS_TESS":HAS_TESS,"SERPAPI_KEY_set":bool(SERPAPI_KEY),"DB_PATH":DB_PATH,"SAVE_DIR":str(SAVE_DIR),
-           "PORT":PORT,"USE_OPENAI_STT":USE_OPENAI_STT,"USE_OPENAI_TTS":USE_OPENAI_TTS,
-           "JARVIS_MODE":STATE["jarvis_mode"],"DEV_MODE":STATE["dev_mode"],"OLLAMA_URLS":AI.list_ollama_urls()}
+    flags={
+        "BACKEND_MODE":STATE["backend_mode"],
+        "OPENAI_MODEL":OPENAI_MODEL,
+        "OLLAMA_MODEL":OLLAMA_MODEL,
+        "HUMANE_TONE":HUMANE_TONE,
+        "HAS_TESS":HAS_TESS,
+        "SERPAPI_KEY_set":bool(SERPAPI_KEY),
+        "DB_PATH":DB_PATH,
+        "SAVE_DIR":str(SAVE_DIR),
+        "PORT":PORT,
+        "USE_OPENAI_STT":USE_OPENAI_STT,
+        "USE_OPENAI_TTS":USE_OPENAI_TTS,
+        "JARVIS_MODE":STATE["jarvis_mode"],
+        "DEV_MODE":STATE["dev_mode"],
+        "OLLAMA_URLS":AI.list_ollama_urls()
+    }
     await update.message.reply_text("Config:\n"+json.dumps(flags, indent=2))
 
 async def backup_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     try:
         zpath=Path("alex_backup.zip")
         with zipfile.ZipFile(zpath,"w",compression=zipfile.ZIP_DEFLATED) as z:
-            if Path(DB_PATH).exists(): z.write(DB_PATH)
-            if RAW_JSONL.exists(): z.write(RAW_JSONL)
+            if Path(DB_PATH).exists():
+                z.write(DB_PATH)
+            if RAW_JSONL.exists():
+                z.write(RAW_JSONL)
             manifest={"files":[str(p) for p in SAVE_DIR.glob("*") if p.is_file()]}
-            man_path=Path("received_manifest.json"); man_path.write_text(json.dumps(manifest, indent=2)); z.write(man_path)
+            man_path=Path("received_manifest.json")
+            man_path.write_text(json.dumps(manifest, indent=2))
+            z.write(man_path)
         await update.message.reply_document(document=str(zpath), filename=zpath.name)
     except Exception as e:
-        logging.exception("Backup error"); await update.message.reply_text(f"Backup error: {e}")
+        logging.exception("Backup error")
+        await update.message.reply_text(f"Backup error: {e}")
 
 # ---- App logic helpers ----
 def _maybe_jarvis_text(text:str)->Tuple[bool,str]:
     t=text.strip()
     lowered=t.lower()
     if lowered.startswith("jarvis:") or lowered.startswith("jarvis,"):
-        return True, t.split(":",1)[1].strip() if ":" in t else t.split(",",1)[1].strip()
+        return True, (t.split(":",1)[1].strip() if ":" in t else t.split(",",1)[1].strip())
     return False, t
 
 async def ai_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=" ".join(ctx.args)
-    if not q: return await update.message.reply_text("Usage: /ai <your prompt>")
+    if not q:
+        return await update.message.reply_text("Usage: /ai <your prompt>")
     is_jarvis, q2=_maybe_jarvis_text(q)
-    # temporary persona override if "jarvis:" prefix used
     persona = persona_prompt() if not is_jarvis else ("You are Alex (Jarvis) — voice-friendly, decisive, short.")
-    ans=AI.chat([{"role":"system","content":persona},{"role":"user","content":q2}], max_tokens=800)
+    ans=AI.chat(
+        [{"role":"system","content":persona},{"role":"user","content":q2}],
+        max_tokens=800
+    )
     log_raw("chat_user", q, {"chat_id":update.effective_chat.id})
     log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
     remember("chat", f"Q: {q}\nA gist: {ans[:400]}")
@@ -574,14 +637,16 @@ async def ai_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def ask_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=" ".join(ctx.args).strip()
-     if not q: return await update.message.reply_text("Usage: /ask <question about anything I've seen/learned>")
+    if not q:
+        return await update.message.reply_text("Usage: /ask <question about anything I've seen/learned>")
     log_raw("chat_user", f"/ask {q}", {"chat_id":update.effective_chat.id})
     ans=await rag_answer(q)
     log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
     await update.message.reply_text(ans)
 
 async def search_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return await update.message.reply_text("Usage: /search <query>")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /search <query>")
     query=" ".join(ctx.args)
     out=serp_search_snippet(query)
     log_raw("chat_user", f"/search {query}", {"chat_id":update.effective_chat.id})
@@ -591,7 +656,8 @@ async def search_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(out)
 
 async def analyze_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return await update.message.reply_text("Usage: /analyze <url>")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /analyze <url>")
     url=ctx.args[0]
     await update.message.reply_text("🔍 Crawling and summarizing…")
     res=await analyze_url(url)
@@ -599,7 +665,8 @@ async def analyze_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def remember_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     text=" ".join(ctx.args).strip()
-    if not text: return await update.message.reply_text("Usage: /remember <text to add to memory>")
+    if not text:
+        return await update.message.reply_text("Usage: /remember <text to add to memory>")
     rid=log_raw("chat_user", f"/remember {text}", {"chat_id":update.effective_chat.id})
     nid=remember("chat", text)
     await update.message.reply_text(f"🧠 Noted (note id {nid}, raw id {rid}). Essence kept, details in raw log.")
@@ -607,17 +674,22 @@ async def remember_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 async def mem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     n=8
     if ctx.args:
-        try: n=max(1,min(40,int(ctx.args[0])))
-        except: pass
+        try:
+            n=max(1,min(40,int(ctx.args[0])))
+        except:
+            pass
     cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id DESC LIMIT ?",(n,))
     rows=cur.fetchall()
-    if not rows: return await update.message.reply_text("🧠 Memory is empty (for now).")
+    if not rows:
+        return await update.message.reply_text("🧠 Memory is empty (for now).")
     lines=[]
     for r in rows:
         lines.append(f"#{r[0]} [{r[2]}] {r[3] or '(no title)'}")
         lines.append("  "+(r[4] or "").replace("\n","\n  ")[:700])
-        if r[5]: lines.append(f"  tags: {r[5]}")
-        if r[7]: lines.append(f"  ref: {r[7]}")
+        if r[5]:
+            lines.append(f"  tags: {r[5]}")
+        if r[7]:
+            lines.append(f"  ref: {r[7]}")
         lines.append("")
     await update.message.reply_text("\n".join(lines)[:3900])
 
@@ -626,22 +698,29 @@ async def exportmem_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     rows=cur.fetchall()
     data=[{"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "","content":r[4] or "",
            "tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""} for r in rows]
-    path=Path("memory_export.json"); path.write_text(json.dumps(data, indent=2))
+    path=Path("memory_export.json")
+    path.write_text(json.dumps(data, indent=2))
     await update.message.reply_document(document=str(path), filename="alex_memory.json")
 
 async def raw_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     n=30
     if ctx.args:
-        try: n=max(1,min(200,int(ctx.args[0])))
-        except: pass
+        try:
+            n=max(1,min(200,int(ctx.args[0])))
+        except:
+            pass
     cur.execute("SELECT id,ts,type,text,meta FROM raw_events ORDER BY id DESC LIMIT ?",(n,))
     rows=cur.fetchall()
-    if not rows: return await update.message.reply_text("Raw memory is empty.")
+    if not rows:
+        return await update.message.reply_text("Raw memory is empty.")
     out=[]
     for r in rows:
-        try: meta=json.loads(r[4] or "{}")
-        except: meta={}
-        txt=(r[3] or "").replace("\n"," ")[:800]; mtxt=f" | meta: {meta}" if meta else ""
+        try:
+            meta=json.loads(r[4] or "{}")
+        except:
+            meta={}
+        txt=(r[3] or "").replace("\n"," ")[:800]
+        mtxt=f" | meta: {meta}" if meta else ""
         out.append(f"#{r[0]} [{r[1]} | {r[2]}] {txt}{mtxt}")
     await update.message.reply_text("\n".join(out)[:3900])
 
@@ -649,22 +728,28 @@ async def raw_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 PENDING_CMDS: Dict[str, Dict[str,Any]] = {}  # id -> {type:'shell'|'py', 'cmd'|'code', 'chat_id'}
 
 async def queue_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    if not PENDING_CMDS: return await update.message.reply_text("✅ Queue empty.")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    if not PENDING_CMDS:
+        return await update.message.reply_text("✅ Queue empty.")
     lines=[]
     for k,v in PENDING_CMDS.items():
         lines.append(f"{k} :: {v['type']} :: {(v.get('cmd') or v.get('code'))[:80]}")
     await update.message.reply_text("\n".join(lines)[:3900])
 
 async def approve_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    if not ctx.args: return await update.message.reply_text("Usage: /approve <id>")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /approve <id>")
     rid=ctx.args[0].strip()
     job=PENDING_CMDS.pop(rid, None)
-    if not job: return await update.message.reply_text("Not found.")
+    if not job:
+        return await update.message.reply_text("Not found.")
     if job["type"]=="shell":
         try:
-            result=subprocess.check_output(job["cmd"], shell=True, text=True, stderr=subprocess.STDOUT, timeout=60)
+            result=subprocess.check_output(job["cmd"], shell=True, text=True,
+                                           stderr=subprocess.STDOUT, timeout=60)
             await update.message.reply_text(f"💻 OK ({rid})\n{result[:3900]}")
         except subprocess.CalledProcessError as e:
             await update.message.reply_text(f"❌ Error ({rid}):\n{(e.output or str(e))[:3900]}")
@@ -672,7 +757,8 @@ async def approve_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Exec error: {e}")
     elif job["type"]=="py":
         try:
-            loc={}; exec(job["code"], {}, loc)  # sandbox-light; trust owner only
+            loc={}
+            exec(job["code"], {}, loc)  # sandbox-light; trust owner only
             await update.message.reply_text(f"🐍 Py OK ({rid}) — keys: {list(loc.keys())[:12]}")
         except Exception as e:
             await update.message.reply_text(f"❌ Py error ({rid}): {e}")
@@ -680,30 +766,43 @@ async def approve_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unknown job type.")
 
 async def deny_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
-    if not ctx.args: return await update.message.reply_text("Usage: /deny <id>")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /deny <id>")
     rid=ctx.args[0].strip()
     if rid in PENDING_CMDS:
-        PENDING_CMDS.pop(rid, None); await update.message.reply_text(f"🛑 Denied {rid}.")
+        PENDING_CMDS.pop(rid, None)
+        await update.message.reply_text(f"🛑 Denied {rid}.")
     else:
         await update.message.reply_text("Not found.")
-
-async def shell_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+        async def shell_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     cmd=" ".join(ctx.args).strip()
-    if not cmd: return await update.message.reply_text("Usage: /shell <command>")
-    job_id=str(uuid.uuid4())[:8]; PENDING_CMDS[job_id]={"type":"shell","cmd":cmd,"chat_id":update.effective_chat.id}
-    await update.message.reply_text(f"⌛ Queued shell command for approval. ID: `{job_id}`", parse_mode="Markdown")
+    if not cmd:
+        return await update.message.reply_text("Usage: /shell <command>")
+    job_id=str(uuid.uuid4())[:8]
+    PENDING_CMDS[job_id]={"type":"shell","cmd":cmd,"chat_id":update.effective_chat.id}
+    await update.message.reply_text(
+        f"⌛ Queued shell command for approval. ID: `{job_id}`",
+        parse_mode="Markdown"
+    )
 
 async def py_request_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     code=" ".join(ctx.args).strip()
-    if not code: return await update.message.reply_text("Usage: /py <single-line python> (multi-line not supported here)")
-    job_id=str(uuid.uuid4())[:8]; PENDING_CMDS[job_id]={"type":"py","code":code,"chat_id":update.effective_chat.id}
-    await update.message.reply_text(f"⌛ Queued python for approval. ID: `{job_id}`", parse_mode="Markdown")
+    if not code:
+        return await update.message.reply_text("Usage: /py <single-line python> (multi-line not supported here)")
+    job_id=str(uuid.uuid4())[:8]
+    PENDING_CMDS[job_id]={"type":"py","code":code,"chat_id":update.effective_chat.id}
+    await update.message.reply_text(
+        f"⌛ Queued python for approval. ID: `{job_id}`",
+        parse_mode="Markdown"
+    )
 
 # --- uploads ---
 async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     doc=update.message.document
-    if not doc: return
+    if not doc:
+        return
     file_path=SAVE_DIR/doc.file_name
     tg_file=await ctx.bot.get_file(doc.file_id)
     await tg_file.download_to_drive(file_path)
@@ -718,8 +817,10 @@ async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         out="Saved. I analyze Excel/CSV/JSON."
     log_raw("chat_alex", out, {"chat_id":update.effective_chat.id})
     await update.message.reply_text(out)
-    async def handle_photo(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo: return
+
+async def handle_photo(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        return
     photo=update.message.photo[-1]
     file=await ctx.bot.get_file(photo.file_id)
     path=SAVE_DIR/f"photo_{photo.file_id}.jpg"
@@ -749,7 +850,8 @@ async def handle_text(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 # ---------- live log watcher ----------
 def _post_to_subscribers(text:str):
-    if not GLOBAL_APP or not MEM_RUNTIME.get("subscribers"): return
+    if not GLOBAL_APP or not MEM_RUNTIME.get("subscribers"):
+        return
     loop=GLOBAL_APP.bot._application.loop
     async def _send():
         for cid in list(MEM_RUNTIME["subscribers"]):
@@ -762,16 +864,6 @@ def _post_to_subscribers(text:str):
     except Exception:
         pass
 
-def simple_scrape(url:str, max_chars:int=2000)->str:
-    try:
-        r=requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code!=200: return f"⚠️ HTTP {r.status_code}"
-        soup=BeautifulSoup(r.text,"html.parser")
-        text=soup.get_text(" ")[:max_chars]
-        title=soup.title.string.strip() if soup.title and soup.title.string else ""
-        return f"{title}\n\n{text}"
-    except Exception as e:
-
 TRADE_PATTERNS=[
     re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
     re.compile(r"order\s+(buy|sell)\s+(\w+).+?@([0-9.]+).+?qty[:= ]?(\d+)", re.I),
@@ -782,8 +874,10 @@ def summarize_trade_line(line:str)->str|None:
         m=pat.search(line)
         if m:
             side,sym,qty,price=list(m.groups())
-            try: qty_i=int(qty)
-            except: qty_i=qty
+            try:
+                qty_i=int(qty)
+            except:
+                qty_i=qty
             return f"🟢 {side.upper()} {sym} qty {qty_i} @ {price}"
     return None
 
@@ -803,15 +897,17 @@ def watch_logs():
                 for line in new.splitlines():
                     s=summarize_trade_line(line)
                     if s:
-                        _post_to_subscribers(s); log_raw("log", line, {"path":path}); remember("log", s, raw_ref=path)
+                        _post_to_subscribers(s)
+                        log_raw("log", line, {"path":path})
+                        remember("log", s, raw_ref=path)
                     now=time.time()
                     if now-last_raw_push>15:
-                        last_raw_push=now; _post_to_subscribers("📜 "+line[:900])
+                        last_raw_push=now
+                        _post_to_subscribers("📜 "+line[:900])
         except Exception as e:
             logging.error("log watcher error: %s", e)
         time.sleep(1)
-
-# ---------- persona synthesis worker ----------
+        # ---------- persona synthesis worker ----------
 def learning_worker():
     while True:
         try:
@@ -831,7 +927,7 @@ def learning_worker():
                                 (datetime.utcnow().isoformat(),"system","Persona",persona,"persona,profile","",row[0]))
                 else:
                     cur.execute("""INSERT INTO notes(ts,source,topic_key,title,content,tags,sentiment,raw_ref)
-                                   VALUES(?,?,?,?,?,?,?,?)""" ,
+                                   VALUES(?,?,?,?,?,?,?,?)""",
                                 (datetime.utcnow().isoformat(),"system",tk,"Persona",persona,"persona,profile","",""))
                 conn.commit()
         except Exception as e:
@@ -840,9 +936,12 @@ def learning_worker():
 
 # ---------- Simple STT/TTS scaffolding (OpenAI-only, optional) ----------
 def transcribe_bytes_wav(b:bytes)->str:
-    if not USE_OPENAI_STT or not OPENAI_KEYS: return ""
+    if not USE_OPENAI_STT or not OPENAI_KEYS:
+        return ""
     try:
-        from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
+        from openai import OpenAI as _New
+        key=OPENAI_KEYS[0]
+        cli=_New(api_key=key)
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             tf.write(b); tf.flush(); path=tf.name
@@ -850,20 +949,29 @@ def transcribe_bytes_wav(b:bytes)->str:
             r=cli.audio.transcriptions.create(model="whisper-1", file=fh)
         return (r.text or "").strip()
     except Exception as e:
-        logging.warning("STT error: %s", e); return ""
+        logging.warning("STT error: %s", e)
+        return ""
 
 def tts_to_mp3(text:str)->bytes:
-    if not USE_OPENAI_TTS or not OPENAI_KEYS: return b""
+    if not USE_OPENAI_TTS or not OPENAI_KEYS:
+        return b""
     try:
-        from openai import OpenAI as _New; key=OPENAI_KEYS[0]; cli=_New(api_key=key)
+        from openai import OpenAI as _New
+        key=OPENAI_KEYS[0]
+        cli=_New(api_key=key)
         r=cli.audio.speech.create(model="gpt-4o-mini-tts", voice=OPENAI_TTS_VOICE, input=text, format="mp3")
         return r.read() if hasattr(r,"read") else (getattr(r,"content",b"") or b"")
     except Exception as e:
-        logging.warning("TTS error: %s", e); return b""
+        logging.warning("TTS error: %s", e)
+        return b""
+
 # ---------- Keep-alive HTTP + iOS Shortcuts webhook ----------
 class Health(BaseHTTPRequestHandler):
     def _ok(self, body:bytes=b"ok", code:int=200, ctype:str="text/plain"):
-        self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(body)
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
         path=urlparse(self.path).path
@@ -882,21 +990,24 @@ class Health(BaseHTTPRequestHandler):
             data=json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             data={}
-        # /shortcut â called from iOS/Apple Watch Shortcuts
+        # /shortcut — called from iOS/Apple Watch Shortcuts
         if path=="/shortcut":
             if not SHORTCUT_SECRET or data.get("secret")!=SHORTCUT_SECRET:
                 return self._ok(b'{"error":"unauthorized"}', 401, "application/json")
             q=(data.get("q") or "").strip()
-            if not q: return self._ok(b'{"error":"missing q"}', 400, "application/json")
-            ans=AI.chat([{"role":"system","content":"You are Alex â concise, helpful, voice-friendly."},
-                         {"role":"user","content":q}], max_tokens=300)
+            if not q:
+                return self._ok(b'{"error":"missing q"}', 400, "application/json")
+            ans=AI.chat(
+                [{"role":"system","content":"You are Alex — concise, helpful, voice-friendly."},
+                 {"role":"user","content":q}], max_tokens=300
+            )
             remember("shortcut", f"Q: {q}\nA: {ans[:400]}")
             # Optional TTS
             audio=tts_to_mp3(ans) if USE_OPENAI_TTS else b""
             body={"answer":ans, "audio_base64": (audio.decode("latin1") if audio else "")}
             return self._ok(json.dumps(body).encode("utf-8"), 200, "application/json")
         return self._ok(b"not found", 404)
-class HealthHandler(BaseHTTPRequestHandler):
+        class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
@@ -904,45 +1015,44 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
 def run_health_server():
-    server_address = ("0.0.0.0", PORT)
-    HTTPServer.allow_reuse_address = True
-    httpd = HTTPServer(server_address, Health)
-    logging.info("Health server running on port %s", PORT)
+    # Use dynamic port if provided (important for deployment environments like Render/Heroku)
+    port = int(os.getenv("PORT", PORT))
+    server_address = ("0.0.0.0", port)
+    httpd = HTTPServer(server_address, HealthHandler)
+    logging.info(f"Health server running on port {port}")
     httpd.serve_forever()
 
 # Run health server in a separate thread
-
-# Start health check server in background
-
-# Keep main thread alive
-if __name__ == "__main__":
-    try:
-        while True:
-            time.sleep(60)
-    except KeyboardInterrupt:
-        print("ð Shutting down.")
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
 
 # ---------- Backend / Jarvis / Guardrails control commands ----------
 async def backend_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
-    if not ctx.args: return await update.message.reply_text("Usage: /backend <auto|openai|ollama>")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /backend <auto|openai|ollama>")
     mode=ctx.args[0].strip().lower()
     if mode not in ("auto","openai","ollama"):
         return await update.message.reply_text("Use one of: auto | openai | ollama")
     STATE["backend_mode"]=mode
     AI.set_backend_mode(mode)
-    await update.message.reply_text(f"â Backend mode set to: {mode}")
+    await update.message.reply_text(f"✅ Backend mode set to: {mode}")
 
 async def ollama_add_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
-    if not ctx.args: return await update.message.reply_text("Usage: /ollama_add <url>")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /ollama_add <url>")
     url=" ".join(ctx.args).strip().rstrip("/")
     AI.add_ollama_url(url)
-    await update.message.reply_text(f"â Added Ollama URL: {url}")
+    await update.message.reply_text(f"✅ Added Ollama URL: {url}")
 
 async def ollama_list_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     urls=AI.list_ollama_urls()
-    await update.message.reply_text("Ollama URLs (priority order):\n"+"\n".join(urls) if urls else "No URLs configured.")
+    await update.message.reply_text(
+        "Ollama URLs (priority order):\n"+"\n".join(urls) if urls else "No URLs configured."
+    )
 
 async def ollama_status_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     urls=AI.list_ollama_urls()
@@ -953,56 +1063,69 @@ async def ollama_status_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
             statuses.append(f"{u} :: {r.status_code}")
         except Exception as e:
             statuses.append(f"{u} :: error {e}")
-    await update.message.reply_text("Ollama status:\n"+"\n".join(statuses) if statuses else "No URLs configured.")
+    await update.message.reply_text(
+        "Ollama status:\n"+"\n".join(statuses) if statuses else "No URLs configured."
+    )
 
 async def jarvis_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
     STATE["jarvis_mode"]=True
-    await update.message.reply_text("ð§  Jarvis mode: ON")
+    await update.message.reply_text("🧠 Jarvis mode: ON")
 
 async def jarvis_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
     STATE["jarvis_mode"]=False
-    await update.message.reply_text("ð§  Jarvis mode: OFF")
+    await update.message.reply_text("🧠 Jarvis mode: OFF")
 
 async def trust_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
     STATE["dev_mode"]=True
-    await update.message.reply_text("âï¸ Guardrails: relaxed (still safe).")
+    await update.message.reply_text("⚙️ Guardrails: relaxed (still safe).")
 
 async def trust_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
+    if not _owner_only(update):
+        return await update.message.reply_text("🚫 Owner only.")
     STATE["dev_mode"]=False
-    await update.message.reply_text("âï¸ Guardrails: standard.")
+    await update.message.reply_text("⚙️ Guardrails: standard.")
 
 async def speak_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return await update.message.reply_text("Usage: /speak <text>")
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /speak <text>")
     text=" ".join(ctx.args)
-    if not USE_OPENAI_TTS: return await update.message.reply_text("TTS disabled. Set USE_OPENAI_TTS=1.")
+    if not USE_OPENAI_TTS:
+        return await update.message.reply_text("TTS disabled. Set USE_OPENAI_TTS=1.")
     audio=tts_to_mp3(text)
-    if not audio: return await update.message.reply_text("TTS failed.")
+    if not audio:
+        return await update.message.reply_text("TTS failed.")
     path=Path("speech.mp3"); path.write_bytes(audio)
     await update.message.reply_audio(audio=InputFile(str(path)), title="Alex says")
-
-# ---------- log path & subscription ----------
+    # ---------- log path & subscription ----------
 async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     n=40
     if ctx.args:
-        try: n=max(1,min(400,int(ctx.args[0])))
-        except: pass
+        try:
+            n=max(1,min(400,int(ctx.args[0])))
+        except:
+            pass
     path=MEM_RUNTIME.get("log_path") or ""
     p=Path(path)
-    if not path or not p.exists(): return await update.message.reply_text("â ï¸ No log path set or file missing. Use /setlog <path>.")
+    if not path or not p.exists():
+        return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
     try:
         lines=p.read_text(errors="ignore").splitlines()[-n:]
         msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
         await update.message.reply_text(msg, parse_mode="Markdown")
     except Exception as e:
-        logging.exception("logs read error"); await update.message.reply_text(f"Read error: {e}")
+        logging.exception("logs read error")
+        await update.message.reply_text(f"Read error: {e}")
 
 async def setlog_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not ctx.args: return await update.message.reply_text("Usage: /setlog /path/to/your.log")
- path=" ".join(ctx.args)
+    if not ctx.args:
+        return await update.message.reply_text("Usage: /setlog /path/to/your.log")
+    path=" ".join(ctx.args)
     MEM_RUNTIME["log_path"]=path
     await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
 
@@ -1063,52 +1186,12 @@ def build_app()->Application:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return app
-
-# ---------- main ----------
-
-# ---------- Ollama monitor (keeps Ollama health checked for 24/7 readiness) ----------
-def ollama_monitor(interval: int = 30):
-    """Background thread: periodically checks configured Ollama endpoints and notifies owner
-    if none are healthy while backend_mode is 'auto'. This helps keep the hybrid backend ready
-    and alerts the owner if the local/remote Ollama instances go down.
-    Minimal, non-invasive: does not change backend selection logic (AI.chat) — it only refreshes
-    the health cache and attempts an owner notification when outages happen."""
-    logging.info("Ollama monitor starting (interval=%ds)", interval)
-    while True:
-        try:
-            urls = AI.list_ollama_urls() if hasattr(AI, 'list_ollama_urls') else []
-            any_ok = False
-            for u in urls:
-                try:
-                    ok = AI._check_ollama(u, ttl=6.0)
-                except Exception:
-                    ok = False
-                any_ok = any_ok or bool(ok)
-            # If none healthy and backend is auto, warn and notify owner (best-effort)
-            if not any_ok and STATE.get("backend_mode", "auto") == "auto" and urls:
-                logging.warning("No healthy Ollama endpoints detected (checked %d urls).", len(urls))
-                # Best-effort owner notify via Telegram (if OWNER_ID set and bot running)
-                try:
-                    if OWNER_ID and OWNER_ID.isdigit() and GLOBAL_APP:
-                        cid = int(OWNER_ID)
-                        msg = ("⚠️ Ollama unreachable: no healthy endpoints. " 
-                               "Alex will fall back to OpenAI when necessary. Check your Ollama hosts.")
-                        loop = GLOBAL_APP.bot._application.loop
-                        asyncio.run_coroutine_threadsafe(GLOBAL_APP.bot.send_message(chat_id=cid, text=msg), loop)
-                except Exception:
-                    logging.exception("ollama_monitor: failed to notify owner")
-            # otherwise just sleep and check again
-            time.sleep(interval)
-        except Exception:
-            logging.exception("ollama_monitor error") 
-            time.sleep(interval)
-
-
-
+    # ---------- main ----------
 def main():
     global GLOBAL_APP
     if not TELEGRAM_TOKEN:
-        logging.error("TELEGRAM_TOKEN missing — exiting."); sys.exit(1)
+        logging.error("TELEGRAM_TOKEN missing — exiting.")
+        sys.exit(1)
     if AI.backend_mode in ("auto","openai") and not OPENAI_KEYS:
         logging.warning("OpenAI path may be used but no OPENAI_API_KEY(S) provided.")
 
@@ -1116,7 +1199,6 @@ def main():
 
     # background threads
     threading.Thread(target=run_health_server, daemon=True).start()
-    threading.Thread(target=ollama_monitor, daemon=True).start()
     threading.Thread(target=learning_worker, daemon=True).start()
     threading.Thread(target=watch_logs, daemon=True).start()
 
