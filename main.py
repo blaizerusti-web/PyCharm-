@@ -179,10 +179,10 @@ class AIBackend:
                 return (j["message"].get("content","") or "").strip()
             if "response" in j:
                 return (j["response"] or "").strip()
-        return "⚠️ Ollama: unexpected response."
+        return "â ï¸ Ollama: unexpected response."
 
     def _openai_chat(self, messages:List[Dict[str,Any]], model:str|None, max_tokens:int=800, timeout:float=60.0)->str:
-        if not OPENAI_KEYS: return "⚠️ OPENAI_API_KEY(S) not set."
+        if not OPENAI_KEYS: return "â ï¸ OPENAI_API_KEY(S) not set."
         attempts=max(3, len(OPENAI_KEYS)); base_sleep=1.1
         last_error=None
         for i in range(attempts):
@@ -197,7 +197,7 @@ class AIBackend:
                     r=self._old_sdk.ChatCompletion.create(model=model or self.openai_model, messages=messages, max_tokens=max_tokens, request_timeout=timeout)
                     return r["choices"][0]["message"]["content"].strip()
                 else:
-                    return "⚠️ OpenAI SDK not available."
+                    return "â ï¸ OpenAI SDK not available."
             except Exception as e:
                 last_error=e
                 msg=str(e).lower()
@@ -207,7 +207,7 @@ class AIBackend:
                     time.sleep(base_sleep*(2**i)+random.random()*0.4)
                     continue
                 break
-        return f"⚠️ OpenAI error: {last_error}"
+        return f"â ï¸ OpenAI error: {last_error}"
 
     def chat(self, messages:List[Dict[str,Any]], model:str|None=None, max_tokens:int=800, timeout:float=60.0)->str:
         mode=self.backend_mode
@@ -216,7 +216,7 @@ class AIBackend:
                 return self._ollama_chat(messages, model, timeout=timeout)
             except Exception as e:
                 logging.error("Ollama error: %s", e)
-                return f"⚠️ Ollama error: {e}"
+                return f"â ï¸ Ollama error: {e}"
         elif mode=="openai":
             return self._openai_chat(messages, model, max_tokens=max_tokens, timeout=timeout)
         else:  # auto (hybrid)
@@ -243,9 +243,9 @@ def _owner_only(update:Update)->bool:
     return OWNER_ID and str(update.effective_user.id)==str(OWNER_ID)
 
 def persona_prompt()->str:
-    base = "You are Alex — concise, helpful, witty, and practical."
+    base = "You are Alex â concise, helpful, witty, and practical."
     if STATE["jarvis_mode"]:
-        base = ("You are Alex (aka Jarvis) — proactive, succinct, voice-friendly. "
+        base = ("You are Alex (aka Jarvis) â proactive, succinct, voice-friendly. "
                 "Offer smart defaults, anticipate needs, and keep answers tight.")
     if STATE["dev_mode"]:
         base += " Be direct and unblocked, but stay safe and lawful."
@@ -263,7 +263,7 @@ async def ask_ai(prompt:str, context:str="")->str:
         )
     except Exception as e:
         logging.exception("ask_ai error")
-        return f"⚠️ AI error: {e}"
+        return f"â ï¸ AI error: {e}"
         # ---------- SQLite memory ----------
 DB_PATH="alex_memory.db"
 conn=sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -286,7 +286,7 @@ def _append_jsonl(obj:dict):
 def log_raw(ev_type:str, text:str, meta:dict|None=None)->int:
     ts=datetime.utcnow().isoformat()
     m=json.dumps(meta or {}, ensure_ascii=False)
-    cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m))
+cur.execute("INSERT INTO raw_events(ts,type,text,meta) VALUES(?,?,?,?)",(ts,ev_type,text,m))
     conn.commit()
     rid=cur.lastrowid
     _append_jsonl({"id":rid,"ts":ts,"type":ev_type,"text":text,"meta":meta or {}})
@@ -430,7 +430,7 @@ async def analyze_url(url:str)->str:
 def analyze_excel(path:Path)->str:
     try:
         df=pd.read_excel(path)
-        head=", ".join(map(str,list(df.columns)[:12]))
+head=", ".join(map(str,list(df.columns)[:12]))
         info=f"✅ Excel loaded: {df.shape[0]} rows × {df.shape[1]} cols\nColumns: {head}"
         num=df.select_dtypes(include="number")
         if not num.empty: info+="\n\nNumeric summary:\n"+num.describe().to_string()[:1800]
@@ -574,7 +574,7 @@ async def ai_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def ask_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     q=" ".join(ctx.args).strip()
-    if not q: return await update.message.reply_text("Usage: /ask <question about anything I've seen/learned>")
+     if not q: return await update.message.reply_text("Usage: /ask <question about anything I've seen/learned>")
     log_raw("chat_user", f"/ask {q}", {"chat_id":update.effective_chat.id})
     ans=await rag_answer(q)
     log_raw("chat_alex", ans, {"chat_id":update.effective_chat.id})
@@ -718,8 +718,7 @@ async def handle_file(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         out="Saved. I analyze Excel/CSV/JSON."
     log_raw("chat_alex", out, {"chat_id":update.effective_chat.id})
     await update.message.reply_text(out)
-
-async def handle_photo(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    async def handle_photo(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not update.message.photo: return
     photo=update.message.photo[-1]
     file=await ctx.bot.get_file(photo.file_id)
@@ -771,8 +770,7 @@ def simple_scrape(url:str, max_chars:int=2000)->str:
         text=soup.get_text(" ")[:max_chars]
         title=soup.title.string.strip() if soup.title and soup.title.string else ""
         return f"{title}\n\n{text}"
-    except SomeError as e:
-    print(f"Error in trading log parser: {e}")
+    except Exception as e:
 
 TRADE_PATTERNS=[
     re.compile(r"\b(BUY|SELL)\b.*?(\b[A-Z]{2,10}\b).*?qty[:= ]?(\d+).*?price[:= ]?([0-9.]+)", re.I),
@@ -862,7 +860,6 @@ def tts_to_mp3(text:str)->bytes:
         return r.read() if hasattr(r,"read") else (getattr(r,"content",b"") or b"")
     except Exception as e:
         logging.warning("TTS error: %s", e); return b""
-
 # ---------- Keep-alive HTTP + iOS Shortcuts webhook ----------
 class Health(BaseHTTPRequestHandler):
     def _ok(self, body:bytes=b"ok", code:int=200, ctype:str="text/plain"):
@@ -885,13 +882,13 @@ class Health(BaseHTTPRequestHandler):
             data=json.loads(raw.decode("utf-8") or "{}")
         except Exception:
             data={}
-        # /shortcut — called from iOS/Apple Watch Shortcuts
+        # /shortcut â called from iOS/Apple Watch Shortcuts
         if path=="/shortcut":
             if not SHORTCUT_SECRET or data.get("secret")!=SHORTCUT_SECRET:
                 return self._ok(b'{"error":"unauthorized"}', 401, "application/json")
             q=(data.get("q") or "").strip()
             if not q: return self._ok(b'{"error":"missing q"}', 400, "application/json")
-            ans=AI.chat([{"role":"system","content":"You are Alex — concise, helpful, voice-friendly."},
+            ans=AI.chat([{"role":"system","content":"You are Alex â concise, helpful, voice-friendly."},
                          {"role":"user","content":q}], max_tokens=300)
             remember("shortcut", f"Q: {q}\nA: {ans[:400]}")
             # Optional TTS
@@ -923,25 +920,25 @@ if __name__ == "__main__":
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
-        print("🛑 Shutting down.")
+        print("ð Shutting down.")
 
 # ---------- Backend / Jarvis / Guardrails control commands ----------
 async def backend_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
     if not ctx.args: return await update.message.reply_text("Usage: /backend <auto|openai|ollama>")
     mode=ctx.args[0].strip().lower()
     if mode not in ("auto","openai","ollama"):
         return await update.message.reply_text("Use one of: auto | openai | ollama")
     STATE["backend_mode"]=mode
     AI.set_backend_mode(mode)
-    await update.message.reply_text(f"✅ Backend mode set to: {mode}")
+    await update.message.reply_text(f"â Backend mode set to: {mode}")
 
 async def ollama_add_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
     if not ctx.args: return await update.message.reply_text("Usage: /ollama_add <url>")
     url=" ".join(ctx.args).strip().rstrip("/")
     AI.add_ollama_url(url)
-    await update.message.reply_text(f"✅ Added Ollama URL: {url}")
+    await update.message.reply_text(f"â Added Ollama URL: {url}")
 
 async def ollama_list_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     urls=AI.list_ollama_urls()
@@ -959,24 +956,24 @@ async def ollama_status_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ollama status:\n"+"\n".join(statuses) if statuses else "No URLs configured.")
 
 async def jarvis_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
     STATE["jarvis_mode"]=True
-    await update.message.reply_text("🧠 Jarvis mode: ON")
+    await update.message.reply_text("ð§  Jarvis mode: ON")
 
 async def jarvis_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
     STATE["jarvis_mode"]=False
-    await update.message.reply_text("🧠 Jarvis mode: OFF")
+    await update.message.reply_text("ð§  Jarvis mode: OFF")
 
 async def trust_on_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
     STATE["dev_mode"]=True
-    await update.message.reply_text("⚙️ Guardrails: relaxed (still safe).")
+    await update.message.reply_text("âï¸ Guardrails: relaxed (still safe).")
 
 async def trust_off_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    if not _owner_only(update): return await update.message.reply_text("🚫 Owner only.")
+    if not _owner_only(update): return await update.message.reply_text("ð« Owner only.")
     STATE["dev_mode"]=False
-    await update.message.reply_text("⚙️ Guardrails: standard.")
+    await update.message.reply_text("âï¸ Guardrails: standard.")
 
 async def speak_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not ctx.args: return await update.message.reply_text("Usage: /speak <text>")
@@ -995,7 +992,7 @@ async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         except: pass
     path=MEM_RUNTIME.get("log_path") or ""
     p=Path(path)
-    if not path or not p.exists(): return await update.message.reply_text("⚠️ No log path set or file missing. Use /setlog <path>.")
+    if not path or not p.exists(): return await update.message.reply_text("â ï¸ No log path set or file missing. Use /setlog <path>.")
     try:
         lines=p.read_text(errors="ignore").splitlines()[-n:]
         msg="```\n"+"\n".join(lines)[-3500:]+"\n```"
@@ -1005,7 +1002,7 @@ async def logs_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
 async def setlog_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     if not ctx.args: return await update.message.reply_text("Usage: /setlog /path/to/your.log")
-    path=" ".join(ctx.args)
+ path=" ".join(ctx.args)
     MEM_RUNTIME["log_path"]=path
     await update.message.reply_text(f"✅ Log path set to: `{path}`", parse_mode="Markdown")
 
