@@ -1309,3 +1309,165 @@ if __name__ == "__main__":
 # USE_OPENAI_STT=0|1
 # USE_OPENAI_TTS=0|1
 # OPENAI_TTS_VOICE=alloy
+# =========================
+# Reinforcement Patch (append-only) — /learn, /dream, /search_all, wide recall, optional vectors stub
+# Paste this entire block at the very bottom of mega.py
+# =========================
+
+# ---- Config knobs (safe defaults) ----
+REINFORCE_WIDE_RAW_LIMIT   = 20000   # how many recent raw_events to scan in /search_all
+REINFORCE_WIDE_NOTES_LIMIT = 20000   # how many recent notes to scan in /search_all
+REINFORCE_TOPK_RAW         = 30
+REINFORCE_TOPK_NOTES       = 30
+
+# Optional: vectors stub (no external deps; can be wired up later)
+class _VectorStoreStub:
+    def __init__(self):
+        self._on = False
+    def enable(self): self._on = True
+    def disable(self): self._on = False
+    def add(self, _text:str, _meta:dict|None=None): 
+        # Plug real embeddings later (e.g., sentence-transformers or OpenAI embeddings)
+        return None
+    def search(self, _query:str, _k:int=10):
+        return []  # return [] until wired
+
+VECTOR_STORE = _VectorStoreStub()  # kept off by default
+
+# ---- Helpers (local, non-invasive) ----
+_WORD_RE_REINF = re.compile(r"[a-z0-9]+")
+def _tok_reinf(s:str)->List[str]: return _WORD_RE_REINF.findall(s.lower())
+def _tf_reinf(tokens:List[str])->Dict[str,float]:
+    d={}; n=float(len(tokens)) or 1.0
+    for t in tokens: d[t]=d.get(t,0)+1.0
+    for k in d: d[k]/=n
+    return d
+def _cos_reinf(a:Dict[str,float], b:Dict[str,float])->float:
+    if not a or not b: return 0.0
+    common=set(a)&set(b); num=sum(a[t]*b[t] for t in common)
+    da=math.sqrt(sum(v*v for v in a.values())); db=math.sqrt(sum(v*v for v in b.values()))
+    return 0.0 if da==0 or db==0 else num/(da*db)
+
+def _search_memory_wide(query:str,
+                        scan_raw:int=REINFORCE_WIDE_RAW_LIMIT,
+                        scan_notes:int=REINFORCE_WIDE_NOTES_LIMIT,
+                        k_raw:int=REINFORCE_TOPK_RAW,
+                        k_notes:int=REINFORCE_TOPK_NOTES)->dict:
+    """Wide lexical scan over DB without touching original search_memory()."""
+    qtf=_tf_reinf(_tok_reinf(query))
+
+    # RAW
+    cur.execute("SELECT id,ts,type,text,meta FROM raw_events ORDER BY id DESC LIMIT ?", (max(100, scan_raw),))
+    raw_scored=[]
+    for r in cur.fetchall():
+        txt=r[3] or ""; score=_cos_reinf(qtf, _tf_reinf(_tok_reinf(txt)))
+        if score>0: raw_scored.append((score, {"id":r[0], "ts":r[1], "type":r[2], "text":txt, "meta":r[4]}))
+    raw_top=[x[1] for x in sorted(raw_scored, key=lambda z:z[0], reverse=True)[:k_raw]]
+
+    # NOTES
+    cur.execute("SELECT id,ts,source,title,content,tags,sentiment,raw_ref FROM notes ORDER BY id DESC LIMIT ?", (max(100, scan_notes),))
+    note_scored=[]
+    for r in cur.fetchall():
+        txt=(r[4] or "")+" "+(r[3] or "")+" "+(r[5] or "")
+        score=_cos_reinf(qtf, _tf_reinf(_tok_reinf(txt)))
+        if score>0:
+            note_scored.append((score, {"id":r[0],"ts":r[1],"source":r[2],"title":r[3] or "",
+                                        "content":r[4] or "","tags":r[5] or "","sentiment":r[6] or "","ref":r[7] or ""}))
+    notes_top=[x[1] for x in sorted(note_scored, key=lambda z:z[0], reverse=True)[:k_notes]]
+    return {"raw":raw_top,"notes":notes_top}
+
+def _ctx_blurb_reinf(found:dict, max_chars:int=3800)->str:
+    parts=[]
+    for n in found.get("notes",[]):
+        blk=f"[NOTE #{n['id']} | {n['ts']} | {n['source']} | {n['title']}] {n['content']}"
+        if n.get("tags"): blk+=f" (tags: {n['tags']})"
+        parts.append(blk)
+    for r in found.get("raw",[]):
+        txt=r["text"]; txt=txt[:600]+"…" if len(txt)>600 else txt
+        parts.append(f"[RAW #{r['id']} | {r['ts']} | {r['type']}] {txt}")
+    return "\n\n".join(parts)[:max_chars]
+
+# ---- Commands: /learn, /dream, /search_all ----
+async def learn_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """Force commit something to long-term memory."""
+    text=" ".join(ctx.args).strip()
+    if not text:
+        return await update.message.reply_text("Usage: /learn <text to store>")
+    rid = log_raw("learn", text, {"by": update.effective_user.id if update and update.effective_user else ""})
+    nid = remember("learn", text)
+    await update.message.reply_text(f"🧠 Learned. note_id={nid}, raw_id={rid}")
+
+async def dream_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """One-off background compaction: condense recent memory into a super-note."""
+    # Pull recent slices
+    try:
+        cur.execute("SELECT id,ts,type,text FROM raw_events ORDER BY id DESC LIMIT 800")
+        raws=cur.fetchall()
+        cur.execute("SELECT id,ts,source,title,content FROM notes ORDER BY id DESC LIMIT 300")
+        notes=cur.fetchall()
+    except Exception as e:
+        logging.exception("dream fetch error")
+        return await update.message.reply_text(f"⚠️ dream fetch error: {e}")
+
+    # Build source blob
+    parts=[]
+    if notes:
+        parts.append("== NOTES ==")
+        for n in notes:
+            parts.append(f"[#{n[0]} {n[1]} {n[2]} | {n[3]}]\n{(n[4] or '')[:800]}")
+    if raws:
+        parts.append("\n== RAW ==")
+        for r in raws:
+            parts.append(f"[#{r[0]} {r[1]} {r[2]}]\n{(r[3] or '')[:600]}")
+    blob="\n\n".join(parts)[:140000]  # guardrail
+
+    # Ask AI to compress
+    summary = await ask_ai(
+        "Compress into a durable 'super-note': bullet summary (max ~200-300 words), key facts," 
+        " stable preferences, recurring entities, unresolved items.",
+        context=persona_prompt() + " You compress internal logs."
+    )
+    # If model returns empty (e.g., offline), fall back to simple slice
+    if not summary or summary.startswith("⚠️"):
+        summary = blob[:1200]
+
+    nid = remember("dream", f"Super-note synthesis:\n\n{summary}")
+    await update.message.reply_text(f"💤 Dreamed a super-note (id {nid}).")
+
+async def search_all_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """Wide search across a larger window of memory (raw + notes)."""
+    q=" ".join(ctx.args).strip()
+    if not q:
+        return await update.message.reply_text("Usage: /search_all <query>")
+    found=_search_memory_wide(q)
+    ctx_blurb=_ctx_blurb_reinf(found)
+    if not ctx_blurb:
+        return await update.message.reply_text("No matches (in wide scan).")
+    await update.message.reply_text(ctx_blurb[:3900])
+
+# ---- Auto-register when GLOBAL_APP exists (no edits to your build_app needed) ----
+def _register_reinforcement_handlers():
+    try:
+        if not GLOBAL_APP: 
+            return False
+        GLOBAL_APP.add_handler(CommandHandler("learn", learn_cmd))
+        GLOBAL_APP.add_handler(CommandHandler("dream", dream_cmd))
+        GLOBAL_APP.add_handler(CommandHandler("search_all", search_all_cmd))
+        logging.info("Reinforcement handlers registered: /learn, /dream, /search_all")
+        return True
+    except Exception as e:
+        logging.exception("Reinforcement registration error: %s", e)
+        return False
+
+def _wait_and_register():
+    # Poll until main set GLOBAL_APP
+    for _ in range(120):  # ~60s worst-case
+        if _register_reinforcement_handlers():
+            return
+        time.sleep(0.5)
+    logging.warning("Reinforcement handlers could not register (GLOBAL_APP not ready).")
+
+threading.Thread(target=_wait_and_register, daemon=True).start()
+# =========================
+# End Reinforcement Patch
+# =========================
