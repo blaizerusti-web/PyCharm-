@@ -1232,6 +1232,35 @@ async def trust_off_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚙️ Guardrails: standard.")
 
 # ---------- Build + Run App ----------
+async def diag_cmd(update, context):
+    try:
+        from pathlib import Path as _P
+        dbp = str(MEMORY_DB_PATH) if 'MEMORY_DB_PATH' in globals() else 'unknown'
+        jlp = str(RAW_EVENTS_PATH) if 'RAW_EVENTS_PATH' in globals() else 'unknown'
+        rows = []
+        try:
+            rows = conn.execute("SELECT id, ts, type, substr(text,1,80) FROM raw_events ORDER BY id DESC LIMIT 3").fetchall()
+        except Exception as e:
+            rows = [("sqlite-error", str(e))]
+        jsonl_tail = []
+        try:
+            if os.path.exists(jlp):
+                with open(jlp, "r", encoding="utf-8") as f:
+                    jsonl_tail = f.readlines()[-3:]
+        except Exception as e:
+            jsonl_tail = [f"jsonl-error: {e}"]
+        msg = (
+            "🔎 /diag\n"
+            f"cwd: {_P.cwd()}\n"
+            f"DB:  {dbp}\n"
+            f"JSONL: {jlp}\n"
+            f"sqlite last 3: {rows}\n"
+            f"jsonl last 3: {''.join(jsonl_tail) if jsonl_tail else '(none)'}"
+        )
+        await update.message.reply_text(msg[:3900])
+    except Exception as e:
+        await update.message.reply_text(f"diag error: {e}")
+
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1486,32 +1515,3 @@ threading.Thread(target=_wait_and_register, daemon=True).start()
 # =========================
 # End Reinforcement Patch
 # =========================
-
-async def diag_cmd(update, context):
-    try:
-        from pathlib import Path as _P
-        dbp = str(MEMORY_DB_PATH) if 'MEMORY_DB_PATH' in globals() else 'unknown'
-        jlp = str(RAW_EVENTS_PATH) if 'RAW_EVENTS_PATH' in globals() else 'unknown'
-        rows = []
-        try:
-            rows = conn.execute("SELECT id, ts, type, substr(text,1,80) FROM raw_events ORDER BY id DESC LIMIT 3").fetchall()
-        except Exception as e:
-            rows = [("sqlite-error", str(e))]
-        jsonl_tail = []
-        try:
-            if os.path.exists(jlp):
-                with open(jlp, "r", encoding="utf-8") as f:
-                    jsonl_tail = f.readlines()[-3:]
-        except Exception as e:
-            jsonl_tail = [f"jsonl-error: {e}"]
-        msg = (
-            "🔎 /diag\n"
-            f"cwd: {_P.cwd()}\n"
-            f"DB:  {dbp}\n"
-            f"JSONL: {jlp}\n"
-            f"sqlite last 3: {rows}\n"
-            f"jsonl last 3: {''.join(jsonl_tail) if jsonl_tail else '(none)'}"
-        )
-        await update.message.reply_text(msg[:3900])
-    except Exception as e:
-        await update.message.reply_text(f"diag error: {e}")
