@@ -9,6 +9,26 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict, Any, List, Tuple
 
+# ===== .env bootstrapping (added by assistant) =====
+from pathlib import Path as _Path_env
+import os as _os_env
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except Exception:  # install on the fly if missing
+    import subprocess as _sub_env, sys as _sys_env
+    try:
+        _sub_env.check_call([_sys_env.executable, "-m", "pip", "install", "python-dotenv", "--quiet"])
+        from dotenv import load_dotenv as _load_dotenv
+    except Exception as _e_env:
+        _load_dotenv = None
+
+if '_load_dotenv' in globals() and _load_dotenv:
+    _load_dotenv(dotenv_path=_Path_env(".env"))
+# soft read (don't crash here; main code will validate)
+_TELEGRAM_TOKEN_ENV = _os_env.getenv("TELEGRAM_TOKEN", "")
+_OPENAI_API_KEY_ENV = _os_env.getenv("OPENAI_API_KEY", "") or _os_env.getenv("OPENAI_API_KEYS", "")
+# ===== end .env bootstrapping =====
+
 # ---------- bootstrap: install/import ----------
 def _ensure(import_name: str, pip_name: str | None = None):
     try:
