@@ -489,25 +489,21 @@ async def fetch_url(url: str) -> str:
 
 async def analyze_url(url: str) -> str:
     content = await fetch_url(url)
-    if content.startswith("⚠️"):
-        return content
+    if not content or content.startswith("⚠️"):
+        rid = log_raw("fetch-fail", f"{url}", {"src": "analyze"})
+        remember("analyze", f"Failed to fetch or empty content: {url}")
+        return f"⚠️ Fetch error for {url}"
+    # Summarize page for memory
     summary = await ask_ai(
-        f"""Compress into a durable super-note: bullet summary (max ~200-300 words), key facts, stable preferences, recurring entities, unresolved items.
-
-SOURCE:
-{blob}""",
-        context=persona_prompt() + " You compress internal logs."
-    ), key facts, stable preferences, recurring entities, unresolved items.
-
-SOURCE:
-{blob}''',
-        context=persona_prompt() + " You compress internal logs."
+        f"Summarize key points for long-term memory (3–6 bullets):\n\n{content[:5000]}",
+        context=persona_prompt()
     )
     log_raw("link", summary, {"url": url})
     remember("link", summary, raw_ref=url)
     return summary
 
 # ---------- File analyzers ----------
+
 def analyze_excel(path: Path) -> str:
     try:
         df = pd.read_excel(path)
