@@ -492,7 +492,12 @@ async def analyze_url(url: str) -> str:
     if content.startswith("⚠️"):
         return content
     summary = await ask_ai(
-        f'''Compress into a durable "super-note": bullet summary (max ~200-300 words), key facts, stable preferences, recurring entities, unresolved items.
+        f"""Compress into a durable super-note: bullet summary (max ~200-300 words), key facts, stable preferences, recurring entities, unresolved items.
+
+SOURCE:
+{blob}""",
+        context=persona_prompt() + " You compress internal logs."
+    ), key facts, stable preferences, recurring entities, unresolved items.
 
 SOURCE:
 {blob}''',
@@ -1435,16 +1440,13 @@ async def dream_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
     # Ask AI to compress
     summary = await ask_ai(
-        f"Compress into a durable 'super-note': bullet summary (max ~200-300 words), key facts, stable preferences, recurring entities, unresolved items.
+        f'''Compress into a durable "super-note": bullet summary (max ~200-300 words), key facts,
+stable preferences, recurring entities, and unresolved items.
 
-SOURCE:
-{blob}",
-        context=persona_prompt() + " You compress internal logs."
-    ), key facts," 
-        " stable preferences, recurring entities, unresolved items.",
+SOURCE:\n{blob}''',
         context=persona_prompt() + " You compress internal logs."
     )
-    # If model returns empty (e.g., offline), fall back to simple slice
+# If model returns empty (e.g., offline), fall back to simple slice
     if not summary or summary.startswith("⚠️"):
         summary = blob[:1200]
 
