@@ -94,6 +94,13 @@ logging.info("OCR pytesseract: %s", "available" if HAS_TESS else "not available"
 
 START_TIME=time.time()
 SAVE_DIR=Path("received_files"); SAVE_DIR.mkdir(exist_ok=True)
+# ----- Stable data directory (works no matter where Alex starts) -----
+from pathlib import Path as _AlexPathPatch  # safe alias in case of name collision
+DATA_DIR = _AlexPathPatch(os.getenv("ALEX_DATA", _AlexPathPatch.home() / "AlexData")).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+MEMORY_DB_PATH  = DATA_DIR / "alex_memory.db"
+RAW_EVENTS_PATH = DATA_DIR / "raw_events.jsonl"
+
 # ---------- AI backend (Hybrid: Ollama candidate list + OpenAI rotation/backoff) ----------
 class AIBackend:
     def __init__(self, backend_mode:str, ollama_urls:List[str], ollama_model:str, openai_model:str):
@@ -274,8 +281,8 @@ async def ask_ai(prompt: str, context: str = "") -> str:
         logging.exception("ask_ai error")
         return f"⚠️ AI error: {e}"
         # ---------- SQLite memory ----------
-DB_PATH = "alex_memory.db"
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+DB_PATH = str(MEMORY_DB_PATH)  # (kept for back-compat, now points to stable path)
+conn = sqlite3.connect(str(MEMORY_DB_PATH), check_same_thread=False)
 cur = conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS raw_events(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
@@ -288,9 +295,7 @@ cur.execute("""CREATE TABLE IF NOT EXISTS notes(
   sentiment TEXT, raw_ref TEXT)""")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_topic ON notes(topic_key)")
 conn.commit()
-
-RAW_JSONL = Path("raw_events.jsonl")
-
+RAW_JSONL = RAW_EVENTS_PATH
 def _append_jsonl(obj: dict):
     try:
         with RAW_JSONL.open("a", encoding="utf-8") as f:
@@ -1225,7 +1230,8 @@ def build_app() -> Application:
 
     # Core commands
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("id", id_cmd))
+    
+    app.add_handler(CommandHandler(\"diag\", diag_cmd))app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("uptime", uptime_cmd))
     app.add_handler(CommandHandler("config", config_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
@@ -1423,7 +1429,12 @@ async def dream_cmd(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
     # Ask AI to compress
     summary = await ask_ai(
-        "Compress into a durable 'super-note': bullet summary (max ~200-300 words), key facts," 
+        f"Compress into a durable 'super-note': bullet summary (max ~200-300 words), key facts, stable preferences, recurring entities, unresolved items.
+
+SOURCE:
+{blob}",
+        context=persona_prompt() + " You compress internal logs."
+    ), key facts," 
         " stable preferences, recurring entities, unresolved items.",
         context=persona_prompt() + " You compress internal logs."
     )
@@ -1471,3 +1482,32 @@ threading.Thread(target=_wait_and_register, daemon=True).start()
 # =========================
 # End Reinforcement Patch
 # =========================
+
+async def diag_cmd(update, context):
+    try:
+        from pathlib import Path as _P
+        dbp = str(MEMORY_DB_PATH) if 'MEMORY_DB_PATH' in globals() else 'unknown'
+        jlp = str(RAW_EVENTS_PATH) if 'RAW_EVENTS_PATH' in globals() else 'unknown'
+        rows = []
+        try:
+            rows = conn.execute("SELECT id, ts, type, substr(text,1,80) FROM raw_events ORDER BY id DESC LIMIT 3").fetchall()
+        except Exception as e:
+            rows = [("sqlite-error", str(e))]
+        jsonl_tail = []
+        try:
+            if os.path.exists(jlp):
+                with open(jlp, "r", encoding="utf-8") as f:
+                    jsonl_tail = f.readlines()[-3:]
+        except Exception as e:
+            jsonl_tail = [f"jsonl-error: {e}"]
+        msg = (
+            "🔎 /diag\n"
+            f"cwd: {_P.cwd()}\n"
+            f"DB:  {dbp}\n"
+            f"JSONL: {jlp}\n"
+            f"sqlite last 3: {rows}\n"
+            f"jsonl last 3: {''.join(jsonl_tail) if jsonl_tail else '(none)'}"
+        )
+        await update.message.reply_text(msg[:3900])
+    except Exception as e:
+        await update.message.reply_text(f"diag error: {e}")
