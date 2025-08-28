@@ -1515,3 +1515,4 @@ async def diag_cmd(update, context):
         await update.message.reply_text(msg[:3900])
     except Exception as e:
         await update.message.reply_text(f"diag error: {e}")
+        
