@@ -1230,7 +1230,7 @@ def build_app() -> Application:
 
     # Core commands
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler(\"diag\", diag_cmd))
+    app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("uptime", uptime_cmd))
     app.add_handler(CommandHandler("config", config_cmd))
